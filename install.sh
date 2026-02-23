@@ -382,7 +382,7 @@ type ScanState struct {
 	withVLESS   bool
 }
 
-var scan ScanState
+var scan = ScanState{stopped: 1}
 
 var (
 	bot       *tele.Bot
@@ -760,7 +760,6 @@ func handleText(c tele.Context) error {
 		return err
 	}
 
-	scan.mu.Lock()
 	scan = ScanState{
 		stopped:    0,
 		startTime:  time.Now(),
@@ -770,7 +769,6 @@ func handleText(c tele.Context) error {
 		countries:  countries,
 		withVLESS:  withVLESS,
 	}
-	scan.mu.Unlock()
 
 	go runScan(targets, countries, withVLESS)
 	return nil
