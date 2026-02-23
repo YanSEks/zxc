@@ -5,7 +5,7 @@ set -euo pipefail
 # Cloudflare Scanner v17.1 — installer
 ###############################################################################
 
-INSTALL_DIR="/opt/cfscanner"
+INSTALL_DIR="${CFSCANNER_INSTALL_DIR:-/opt/cfscanner}"
 SERVICE_NAME="cfscanner"
 GO_VERSION="1.22.5"
 VERSION="17.1"
@@ -52,6 +52,15 @@ detect_arch() {
             ;;
     esac
     echo -e "${GREEN}[OK]${NC} Architecture: ${ARCH}"
+}
+
+# ─── OS check ────────────────────────────────────────────────────────────────
+check_os() {
+    if ! command -v apt-get &>/dev/null; then
+        echo -e "${RED}[ERR] Only Debian/Ubuntu are supported${NC}" >&2
+        exit 1
+    fi
+    echo -e "${GREEN}[OK]${NC} OS: $(lsb_release -ds 2>/dev/null || grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'=' -f2 | tr -d '"')"
 }
 
 # ─── system info / auto-tune ─────────────────────────────────────────────────
@@ -188,6 +197,18 @@ optimize_system() {
     sysctl -w net.ipv4.ip_local_port_range="1024 65535" >/dev/null 2>&1 || true
     sysctl -w net.ipv4.tcp_tw_reuse=1            >/dev/null 2>&1 || true
     ulimit -n 1048576 2>/dev/null || true
+
+    cat > /etc/sysctl.d/99-cfscanner.conf << SYSCTL
+net.core.rmem_max=134217728
+net.core.wmem_max=134217728
+net.ipv4.tcp_rmem=4096 87380 134217728
+net.ipv4.tcp_wmem=4096 65536 134217728
+net.core.somaxconn=65535
+net.ipv4.tcp_fin_timeout=15
+net.ipv4.ip_local_port_range=1024 65535
+net.ipv4.tcp_tw_reuse=1
+SYSCTL
+    sysctl --system >/dev/null 2>&1 || true
 }
 
 # ─── GeoIP download (7-day cache) ────────────────────────────────────────────
@@ -236,6 +257,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -274,6 +296,7 @@ type Config struct {
 	VLESSTimeout time.Duration
 	DataDir      string
 	TmpDir       string
+	TLSSkipVerify bool
 }
 
 var cfg Config
@@ -312,7 +335,7 @@ var regions = map[string][]string{
 		"CN", "JP", "KR", "IN", "SG", "HK", "TW", "TH", "VN", "MY",
 		"ID", "PH", "PK", "BD", "MM", "KH", "LA", "MN",
 	},
-	"US": {
+	"AMERICAS": {
 		"US", "CA", "MX", "BR", "AR", "CL", "CO", "PE", "VE",
 	},
 	"FAST": {
@@ -378,11 +401,16 @@ func init() {
 		VLESSTimeout: 8 * time.Second,
 		DataDir:      "/opt/cfscanner/data",
 		TmpDir:       "/opt/cfscanner/tmp",
+		TLSSkipVerify: true,
 	}
 
 	cfg.BotToken = os.Getenv("SCANNER_TOKEN")
 	cfg.AdminID, _ = strconv.ParseInt(os.Getenv("ADMIN_ID"), 10, 64)
 	cfg.VLESSConfig = os.Getenv("VLESS_CONFIG")
+
+	if os.Getenv("TLS_SKIP_VERIFY") == "false" {
+		cfg.TLSSkipVerify = false
+	}
 
 	if v := os.Getenv("MASSCAN_RATE"); v != "" {
 		if r, err := strconv.Atoi(v); err == nil {
@@ -446,7 +474,13 @@ func parseVLESSConfig() {
 
 func main() {
 	debug.SetGCPercent(30)
-	debug.SetMemoryLimit(1800 << 20)
+	memLimit := int64(1800 << 20)
+	if v := os.Getenv("MEM_LIMIT_MB"); v != "" {
+		if mb, err := strconv.Atoi(v); err == nil && mb > 0 {
+			memLimit = int64(mb) << 20
+		}
+	}
+	debug.SetMemoryLimit(memLimit)
 
 	log.Printf("CF Scanner v%s starting...", Version)
 
@@ -493,7 +527,7 @@ func main() {
 
 func initTransport() {
 	transport = &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // #nosec G402
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: cfg.TLSSkipVerify}, // #nosec G402
 		MaxIdleConns:    1000,
 		MaxIdleConnsPerHost: 100,
 		DisableKeepAlives:   false,
@@ -535,7 +569,7 @@ func cmdStart(c tele.Context) error {
 • <code>EU</code> — Европа (28 стран)
 • <code>CIS</code> — СНГ (12 стран)
 • <code>ASIA</code> — Азия (18 стран)
-• <code>US</code> — Америка (9 стран)
+• <code>AMERICAS</code> — Америка (9 стран)
 • <code>FAST</code> — Быстрые ноды
 
 📝 <b>Примеры:</b>
@@ -711,7 +745,7 @@ func handleText(c tele.Context) error {
 	countries = uniqueStrings(countries)
 
 	if len(targets) == 0 {
-		return c.Send("❌ Укажите цель: ASN (AS13335), CIDR (1.1.1.0/24) или регион (EU, CIS, ASIA, US, FAST)")
+		return c.Send("❌ Укажите цель: ASN (AS13335), CIDR (1.1.1.0/24) или регион (EU, CIS, ASIA, AMERICAS, FAST)")
 	}
 
 	targetDesc := strings.Join(targets, " ")
@@ -726,8 +760,9 @@ func handleText(c tele.Context) error {
 		return err
 	}
 
+	scan.mu.Lock()
 	scan = ScanState{
-		stopped:    1,
+		stopped:    0,
 		startTime:  time.Now(),
 		chatID:     c.Chat().ID,
 		msgID:      msg.ID,
@@ -735,7 +770,7 @@ func handleText(c tele.Context) error {
 		countries:  countries,
 		withVLESS:  withVLESS,
 	}
-	atomic.StoreInt32(&scan.stopped, 0)
+	scan.mu.Unlock()
 
 	go runScan(targets, countries, withVLESS)
 	return nil
@@ -792,10 +827,10 @@ func runScan(targets, countries []string, withVLESS bool) {
 		}
 	}
 
-	resolved := resolveCIDRs(cidrs)
-	atomic.StoreInt64(&scan.total, int64(len(resolved)))
+	total := countCIDRIPs(cidrs)
+	atomic.StoreInt64(&scan.total, total)
 
-	if len(resolved) == 0 {
+	if total == 0 {
 		sendMsg("❌ Нет IP адресов для сканирования")
 		return
 	}
@@ -807,8 +842,8 @@ func runScan(targets, countries []string, withVLESS bool) {
 		log.Printf("targets file error: %v", err)
 		return
 	}
-	for _, ip := range resolved {
-		fmt.Fprintln(f, ip)
+	for _, cidr := range cidrs {
+		fmt.Fprintln(f, cidr)
 	}
 	f.Close()
 
@@ -839,9 +874,10 @@ func runScan(targets, countries []string, withVLESS bool) {
 	defer ticker.Stop()
 	done := make(chan struct{})
 
+	var cmdErr error
 	go func() {
 		defer close(done)
-		_ = cmd.Wait()
+		cmdErr = cmd.Wait()
 	}()
 
 	waitLoop:
@@ -856,6 +892,11 @@ func runScan(targets, countries []string, withVLESS bool) {
 			}
 			updateProgress()
 		}
+	}
+
+	if cmdErr != nil && atomic.LoadInt32(&scan.stopped) == 0 {
+		log.Printf("masscan error: %v", cmdErr)
+		sendMsg("⚠️ masscan завершился с ошибкой: " + cmdErr.Error())
 	}
 
 	if atomic.LoadInt32(&scan.stopped) == 1 {
@@ -940,9 +981,12 @@ func checkWorker(op OpenPort, withVLESS bool) *Result {
 	cfLatency := time.Since(start).Milliseconds()
 	defer resp.Body.Close()
 
-	body := make([]byte, 4096)
-	n, _ := resp.Body.Read(body)
-	bodyStr := string(body[:n])
+	limited := io.LimitReader(resp.Body, 4096)
+	body, err := io.ReadAll(limited)
+	if err != nil {
+		return nil
+	}
+	bodyStr := string(body)
 
 	if !strings.Contains(bodyStr, "cloudflare") {
 		return nil
@@ -1053,23 +1097,38 @@ func checkVLESS(ip string, port int) error {
 		return fmt.Errorf("VLESS recv: %w", err)
 	}
 
-	// Skip WebSocket frame header (at least 2 bytes)
+	// Parse WebSocket frame header
 	payload := resp[:n]
-	if len(payload) >= 2 {
-		payload = payload[2:]
+	if len(payload) < 2 {
+		return fmt.Errorf("response too short")
+	}
+	payloadLen := int(payload[1] & 0x7F)
+	headerLen := 2
+	if payloadLen == 126 {
+		if len(payload) < 4 {
+			return fmt.Errorf("response too short for extended payload length")
+		}
+		headerLen = 4
+	} else if payloadLen == 127 {
+		if len(payload) < 10 {
+			return fmt.Errorf("response too short for extended payload length")
+		}
+		headerLen = 10
+	}
+	if payload[1]&0x80 != 0 {
+		headerLen += 4
+	}
+	if len(payload) < headerLen {
+		return fmt.Errorf("response too short for frame header")
+	}
+	if len(payload) > headerLen {
+		payload = payload[headerLen:]
 	}
 	if !strings.Contains(string(payload), "204") && !strings.Contains(string(payload), "HTTP") {
 		return fmt.Errorf("unexpected response")
 	}
 
 	return nil
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // ─── parseUUID ───────────────────────────────────────────────────────────────
@@ -1416,43 +1475,23 @@ func parseMasscan(path string, countries []string) []OpenPort {
 	return ports
 }
 
-// ─── resolveCIDRs ────────────────────────────────────────────────────────────
+// ─── countCIDRIPs ────────────────────────────────────────────────────────────
 
-func resolveCIDRs(cidrs []string) []string {
-	ipSet := make(map[string]struct{})
+func countCIDRIPs(cidrs []string) int64 {
+	var total int64
 	for _, cidr := range cidrs {
 		if !strings.Contains(cidr, "/") {
-			ipSet[cidr] = struct{}{}
+			total++
 			continue
 		}
 		_, network, err := net.ParseCIDR(cidr)
 		if err != nil {
 			continue
 		}
-		for ip := cloneIP(network.IP); network.Contains(ip); incrementIP(ip) {
-			ipSet[ip.String()] = struct{}{}
-		}
+		ones, bits := network.Mask.Size()
+		total += 1 << uint(bits-ones)
 	}
-	result := make([]string, 0, len(ipSet))
-	for ip := range ipSet {
-		result = append(result, ip)
-	}
-	return result
-}
-
-func cloneIP(ip net.IP) net.IP {
-	c := make(net.IP, len(ip))
-	copy(c, ip)
-	return c
-}
-
-func incrementIP(ip net.IP) {
-	for i := len(ip) - 1; i >= 0; i-- {
-		ip[i]++
-		if ip[i] != 0 {
-			break
-		}
-	}
+	return total
 }
 
 // ─── fetchASN ────────────────────────────────────────────────────────────────
@@ -1610,7 +1649,10 @@ build_scanner() {
     export PATH="/usr/local/go/bin:$PATH"
     cd "$INSTALL_DIR"
 
-    go mod tidy 2>&1 | tail -5
+    if ! go mod tidy 2>&1; then
+        echo -e "${RED}[ERR] go mod tidy failed${NC}" >&2
+        exit 1
+    fi
 
     CGO_ENABLED=0 go build \
         -ldflags="-s -w -X main.Version=${VERSION}" \
@@ -1630,6 +1672,8 @@ ADMIN_ID=${ADMIN_ID}
 VLESS_CONFIG=${VLESS_CONFIG:-}
 MASSCAN_RATE=${RATE}
 WORKERS=${WORKERS}
+TLS_SKIP_VERIFY=true
+MEM_LIMIT_MB=${MEM_LIMIT}
 ENV
     chmod 600 "$INSTALL_DIR/.env"
 
@@ -1655,6 +1699,9 @@ StandardError=journal
 SyslogIdentifier=cfscanner
 KillMode=mixed
 TimeoutStopSec=30
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=${INSTALL_DIR}
 
 [Install]
 WantedBy=multi-user.target
@@ -1693,6 +1740,7 @@ main() {
     show_banner
     check_root
     detect_arch
+    check_os
     get_system_info
     get_credentials
     cleanup_old
