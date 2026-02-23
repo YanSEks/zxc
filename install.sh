@@ -867,6 +867,9 @@ func runScan(targets, countries []string, withVLESS bool) {
 		return
 	}
 
+	// Show progress immediately on scan start
+	updateProgress()
+
 	// Progress ticker
 	ticker := time.NewTicker(12 * time.Second)
 	defer ticker.Stop()
@@ -906,6 +909,11 @@ func runScan(targets, countries []string, withVLESS bool) {
 	// Parse masscan results
 	scan.openPorts = parseMasscan(outputFile, countries)
 
+	// Reset counters for worker-phase progress
+	atomic.StoreInt64(&scan.total, int64(len(scan.openPorts)))
+	atomic.StoreInt64(&scan.checked, 0)
+	updateProgress()
+
 	// Check workers
 	wc := cfg.Workers
 	if withVLESS && vless.Enabled {
@@ -918,7 +926,26 @@ func runScan(targets, countries []string, withVLESS bool) {
 	semaphore := make(chan struct{}, wc)
 	resultsCh := make(chan Result, len(scan.openPorts)+1)
 
+	// Ticker for progress updates during worker phase
+	workerTicker := time.NewTicker(5 * time.Second)
+	workerDone := make(chan struct{})
+	go func() {
+		defer workerTicker.Stop()
+		for {
+			select {
+			case <-workerTicker.C:
+				if atomic.LoadInt32(&scan.stopped) == 1 {
+					return
+				}
+				updateProgress()
+			case <-workerDone:
+				return
+			}
+		}
+	}()
+
 	var wg sync.WaitGroup
+	defer close(workerDone)
 	for _, op := range scan.openPorts {
 		if atomic.LoadInt32(&scan.stopped) == 1 {
 			break
