@@ -1826,7 +1826,7 @@ async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  REMOVECONFIG — КОМАНДЫ
 # ══════════════════════════════════════════════════════════════════════════════
 
-_REMOVECONFIG_TIMEOUT = 300  # 5 minutes
+_REMOVECONFIG_TIMEOUT_SECONDS = 300  # 5 minutes
 
 
 async def _send_removeconfig_list(
@@ -1986,7 +1986,7 @@ async def handle_removeconfig_input(update: Update, context: ContextTypes.DEFAUL
         return
 
     # Check timeout
-    if time.monotonic() - pending.get("timestamp", 0) > _REMOVECONFIG_TIMEOUT:
+    if time.monotonic() - pending.get("timestamp", 0) > _REMOVECONFIG_TIMEOUT_SECONDS:
         context.user_data.pop("removeconfig_pending", None)
         return await update.message.reply_text(
             "⏰ Время ожидания истекло. Повторите /removeconfig."
@@ -2019,7 +2019,7 @@ async def handle_removeconfig_input(update: Update, context: ContextTypes.DEFAUL
             pending["timestamp"] = time.monotonic()
             return await update.message.reply_text(
                 f"⚠️ Все конфиги будут удалены. Файл станет пустым.\n"
-                f"Удалить клиента целиком? Отправьте <b>да</b> или /cancel",
+                f"Удалить клиента целиком? Отправьте <b>да</b> (или yes) или /cancel",
                 parse_mode="HTML",
             )
 
