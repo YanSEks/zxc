@@ -1046,6 +1046,206 @@ def inject_rules(text: str) -> tuple[str, str]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  REMOVECONFIG — УТИЛИТЫ
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def parse_line_selection(text: str, max_num: int) -> list[int]:
+    """Parse user input like '1 3-5 8' into sorted list of 0-based indices.
+
+    Supports single numbers, ranges (inclusive), mix, and 'all' keyword.
+    Validates all numbers are in range [1, max_num].
+    Returns sorted, deduplicated 0-based indices.
+    Raises ValueError on invalid input.
+    """
+    text = text.strip()
+    if text.lower() == "all":
+        return list(range(max_num))
+
+    indices = set()
+    tokens = re.split(r"[\s,]+", text)
+    for token in tokens:
+        if not token:
+            continue
+        if "-" in token:
+            parts = token.split("-", 1)
+            if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+                raise ValueError(f"Неверный диапазон: {token}")
+            start, end = int(parts[0]), int(parts[1])
+            if start < 1 or end < start or end > max_num:
+                raise ValueError(
+                    f"Диапазон {token} вне допустимого [1, {max_num}]"
+                )
+            for i in range(start, end + 1):
+                indices.add(i - 1)
+        elif token.isdigit():
+            n = int(token)
+            if n < 1 or n > max_num:
+                raise ValueError(f"Номер {n} вне допустимого [1, {max_num}]")
+            indices.add(n - 1)
+        else:
+            raise ValueError(f"Неверный токен: {token}")
+
+    if not indices:
+        raise ValueError("Не указаны номера для удаления")
+
+    return sorted(indices)
+
+
+def list_text_configs(content: str) -> tuple[list[dict], bool]:
+    """Parse text/base64 content into list of config entries.
+
+    Returns (configs_list, was_base64).
+    Each entry: {"line": "vless://...", "display": "1. [VLESS] Name",
+                 "protocol": "vless", "name": "Name"}
+    """
+    stripped = content.strip()
+    was_base64 = False
+
+    # Try base64 decode
+    lines = stripped.splitlines()
+    if len(lines) == 1 and not any(
+        stripped.startswith(p)
+        for p in ("vless://", "vmess://", "trojan://", "ss://")
+    ):
+        try:
+            payload = stripped + "=" * (-len(stripped) % 4)
+            decoded = b64.b64decode(payload).decode("utf-8", errors="ignore")
+            if any(
+                decoded.strip().startswith(p)
+                for p in ("vless://", "vmess://", "trojan://", "ss://")
+            ):
+                lines = decoded.strip().splitlines()
+                was_base64 = True
+        except Exception:
+            pass
+
+    configs = []
+    num = 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        protocol = None
+        for p in ("vless", "vmess", "trojan", "ss"):
+            if line.lower().startswith(f"{p}://"):
+                protocol = p
+                break
+        if protocol is None:
+            continue
+        name = _extract_name_from_uri(line) or line[:40]
+        num += 1
+        configs.append({
+            "line": line,
+            "display": f"{num}. [{protocol.upper()}] {name}",
+            "protocol": protocol,
+            "name": name,
+        })
+
+    return configs, was_base64
+
+
+_SYSTEM_TAGS = {"direct", "block", "dns", "dns-out", "bypass", "reject"}
+_SYSTEM_TYPES = {"direct", "block", "blackhole", "dns", "selector", "urltest"}
+
+
+def list_json_configs(content: str) -> tuple[list[dict], list[dict]]:
+    """Parse JSON and list outbound entries.
+
+    Returns (proxy_outbounds, system_outbounds).
+    proxy entry: {"index": N, "display": "...", "tag": "...", "outbound": {...}}
+    system_outbounds: outbounds with tags/types in skip set
+    """
+    data = json.loads(content)
+    outbounds = data.get("outbounds", [])
+
+    proxy_list = []
+    system_list = []
+    proxy_num = 0
+
+    for i, ob in enumerate(outbounds):
+        tag = ob.get("tag", "")
+        ob_type = ob.get("type", ob.get("protocol", ""))
+        if tag.lower() in _SYSTEM_TAGS or ob_type in _SYSTEM_TYPES:
+            system_list.append({"index": i, "tag": tag, "type": ob_type, "outbound": ob})
+            continue
+
+        # Extract server address for display
+        server = ob.get("server", "")
+        port = ob.get("server_port", ob.get("port", ""))
+        addr = f"{server}:{port}" if server else ""
+
+        proxy_num += 1
+        proxy_list.append({
+            "index": i,
+            "display": f"{proxy_num}. [{ob_type}] {tag}" + (f" → {addr}" if addr else ""),
+            "tag": tag,
+            "type": ob_type,
+            "outbound": ob,
+        })
+
+    return proxy_list, system_list
+
+
+def remove_text_configs(
+    content: str, indices: list[int], was_base64: bool
+) -> tuple[str, int, int]:
+    """Remove lines at given 0-based indices. Returns (new_content, removed, remaining).
+
+    Re-encodes to base64 if was_base64=True.
+    """
+    stripped = content.strip()
+    if was_base64:
+        payload = stripped + "=" * (-len(stripped) % 4)
+        decoded = b64.b64decode(payload).decode("utf-8", errors="ignore")
+        lines = [ln for ln in decoded.strip().splitlines() if ln.strip()]
+    else:
+        lines = [ln for ln in stripped.splitlines() if ln.strip()]
+
+    index_set = set(indices)
+    new_lines = [ln for i, ln in enumerate(lines) if i not in index_set]
+    removed = len(lines) - len(new_lines)
+    remaining = len(new_lines)
+
+    new_text = "\n".join(new_lines)
+    if was_base64 and new_text:
+        new_text = b64.b64encode(new_text.encode("utf-8")).decode("ascii")
+
+    return new_text, removed, remaining
+
+
+def remove_json_configs(
+    content: str, indices: list[int]
+) -> tuple[str, int, int]:
+    """Remove proxy outbounds at given 0-based indices. Returns (new_content, removed, remaining).
+
+    Keeps system outbounds. Re-injects blocking rules via inject_rules().
+    """
+    data = json.loads(content)
+    outbounds = data.get("outbounds", [])
+
+    proxy_list, _ = list_json_configs(content)
+    tags_to_remove = {proxy_list[i]["tag"] for i in indices if i < len(proxy_list)}
+
+    new_outbounds = [ob for ob in outbounds if ob.get("tag", "") not in tags_to_remove]
+    removed = len(outbounds) - len(new_outbounds)
+    data["outbounds"] = new_outbounds
+
+    # Re-inject rules on the stripped content, then inject_rules handles the rest
+    stripped_json = json.dumps(data, indent=2, ensure_ascii=False)
+    new_content, _ = inject_rules(stripped_json)
+
+    new_proxy = [
+        ob for ob in json.loads(new_content).get("outbounds", [])
+        if ob.get("tag", "").lower() not in _SYSTEM_TAGS
+        and ob.get("type", ob.get("protocol", "")) not in _SYSTEM_TYPES
+    ]
+    remaining = len(new_proxy)
+
+    return new_content, removed, remaining
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  HTTP
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1328,6 +1528,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>Команды:</b>\n"
         f"/list — список ссылок\n"
         f"/delete &lt;name&gt; — удалить\n"
+        f"/removeconfig &lt;name&gt; — удалить отдельные конфиги из клиента\n"
+        f"/cancel — отменить текущую операцию\n"
         f"/refresh — обновить все конфиги\n"
         f"/status — статус бота\n"
         f"/export — экспорт БД для миграции\n"
@@ -1620,9 +1822,274 @@ async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await m.edit_text(f"❌ Ошибка импорта: {e}")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  REMOVECONFIG — КОМАНДЫ
+# ══════════════════════════════════════════════════════════════════════════════
+
+_REMOVECONFIG_TIMEOUT_SECONDS = 300  # 5 minutes
+
+
+async def _send_removeconfig_list(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    client_name: str,
+) -> None:
+    """Read client file and show numbered config list, storing state for input."""
+    db = await load_db()
+    if client_name not in db:
+        msg = f"⚠️ Клиент <code>{client_name}</code> не найден. /list"
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(msg, parse_mode="HTML")
+        else:
+            await update.message.reply_text(msg, parse_mode="HTML")
+        return
+
+    ext = db[client_name].get("ext", "txt")
+    fpath = os.path.join(REPO_DIR, f"{client_name}.{ext}")
+
+    if not os.path.exists(fpath):
+        msg = (
+            f"⚠️ Файл <code>{client_name}.{ext}</code> не найден в репозитории.\n"
+            f"Используйте /delete {client_name} для удаления из БД."
+        )
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(msg, parse_mode="HTML")
+        else:
+            await update.message.reply_text(msg, parse_mode="HTML")
+        return
+
+    async with aiofiles.open(fpath, "r", encoding="utf-8") as f:
+        content = await f.read()
+
+    if ext == "json":
+        try:
+            proxy_list, system_list = list_json_configs(content)
+        except Exception as e:
+            reply = f"❌ Ошибка разбора JSON: {e}"
+            if update.callback_query:
+                await update.callback_query.edit_message_text(reply)
+            else:
+                await update.message.reply_text(reply)
+            return
+
+        if not proxy_list:
+            reply = f"ℹ️ У клиента <code>{client_name}</code> нет proxy-outbound'ов."
+            if update.callback_query:
+                await update.callback_query.edit_message_text(reply, parse_mode="HTML")
+            else:
+                await update.message.reply_text(reply, parse_mode="HTML")
+            return
+
+        system_tags = ", ".join(ob["tag"] for ob in system_list) if system_list else "—"
+        lines = [f"📄 Outbound'ы клиента <b>{client_name}</b> ({len(proxy_list)} proxy + {len(system_list)} system):\n"]
+        for entry in proxy_list:
+            lines.append(entry["display"])
+        lines.append(f"\n⚙️ Системные (не удаляются): {system_tags}")
+        lines.append(
+            "\nОтправьте номера для удаления:\n"
+            "  • Отдельные: <code>3 5 12</code>\n"
+            "  • Диапазон: <code>3-7</code>\n"
+            "  • Все proxy: <code>all</code>\n"
+            "  • Отмена: /cancel"
+        )
+        context.user_data["removeconfig_pending"] = {
+            "client": client_name,
+            "ext": "json",
+            "count": len(proxy_list),
+            "timestamp": time.monotonic(),
+        }
+    else:
+        try:
+            cfg_list, was_base64 = list_text_configs(content)
+        except Exception as e:
+            reply = f"❌ Ошибка разбора конфигов: {e}"
+            if update.callback_query:
+                await update.callback_query.edit_message_text(reply)
+            else:
+                await update.message.reply_text(reply)
+            return
+
+        if not cfg_list:
+            reply = f"ℹ️ У клиента <code>{client_name}</code> нет URI-конфигов."
+            if update.callback_query:
+                await update.callback_query.edit_message_text(reply, parse_mode="HTML")
+            else:
+                await update.message.reply_text(reply, parse_mode="HTML")
+            return
+
+        lines = [f"📄 Конфиги клиента <b>{client_name}</b> ({len(cfg_list)} шт.):\n"]
+        for entry in cfg_list:
+            lines.append(entry["display"])
+        lines.append(
+            "\nОтправьте номера для удаления:\n"
+            "  • Отдельные: <code>3 5 12</code>\n"
+            "  • Диапазон: <code>3-7</code>\n"
+            "  • Смешанно: <code>1 3-5 8</code>\n"
+            "  • Все: <code>all</code>\n"
+            "  • Отмена: /cancel"
+        )
+        context.user_data["removeconfig_pending"] = {
+            "client": client_name,
+            "ext": ext,
+            "was_base64": was_base64,
+            "count": len(cfg_list),
+            "timestamp": time.monotonic(),
+        }
+
+    # Send in chunks if long
+    full_text = "\n".join(lines)
+    if len(full_text) > TG_MSG_LIMIT:
+        chunks = []
+        chunk = ""
+        for line in lines:
+            if len(chunk) + len(line) + 1 > TG_MSG_LIMIT:
+                chunks.append(chunk)
+                chunk = line
+            else:
+                chunk = (chunk + "\n" + line) if chunk else line
+        if chunk:
+            chunks.append(chunk)
+
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(chunks[0], parse_mode="HTML")
+            for ch in chunks[1:]:
+                await update.effective_message.reply_text(ch, parse_mode="HTML")
+        else:
+            for ch in chunks:
+                await update.message.reply_text(ch, parse_mode="HTML")
+    else:
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(full_text, parse_mode="HTML")
+        else:
+            await update.message.reply_text(full_text, parse_mode="HTML")
+
+
+@owner_only
+async def cmd_removeconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /removeconfig <client_name>."""
+    if not context.args:
+        return await update.message.reply_text(
+            "⚠️ Использование: <code>/removeconfig &lt;name&gt;</code>\n/list",
+            parse_mode="HTML",
+        )
+    await _send_removeconfig_list(update, context, context.args[0])
+
+
+async def handle_removeconfig_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Process the number selection for config removal."""
+    pending = context.user_data.get("removeconfig_pending")
+    if not pending:
+        return
+
+    # Check timeout
+    if time.monotonic() - pending.get("timestamp", 0) > _REMOVECONFIG_TIMEOUT_SECONDS:
+        context.user_data.pop("removeconfig_pending", None)
+        return await update.message.reply_text(
+            "⏰ Время ожидания истекло. Повторите /removeconfig."
+        )
+
+    client_name = pending["client"]
+    ext = pending["ext"]
+    count = pending["count"]
+    text = (update.message.text or "").strip()
+
+    # Handle "да" confirmation for remove-all warning
+    if pending.get("awaiting_confirm"):
+        if text.lower() in ("да", "yes", "y"):
+            indices = list(range(count))
+            pending.pop("awaiting_confirm", None)
+        else:
+            context.user_data.pop("removeconfig_pending", None)
+            return await update.message.reply_text("❌ Операция отменена.")
+    else:
+        try:
+            indices = parse_line_selection(text, count)
+        except ValueError as e:
+            return await update.message.reply_text(
+                f"⚠️ {e}\nПовторите ввод или /cancel"
+            )
+
+        # Warn if removing all proxy configs
+        if len(indices) == count:
+            pending["awaiting_confirm"] = True
+            pending["timestamp"] = time.monotonic()
+            return await update.message.reply_text(
+                f"⚠️ Все конфиги будут удалены. Файл станет пустым.\n"
+                f"Удалить клиента целиком? Отправьте <b>да</b> (или yes) или /cancel",
+                parse_mode="HTML",
+            )
+
+    db = await load_db()
+    if client_name not in db:
+        context.user_data.pop("removeconfig_pending", None)
+        return await update.message.reply_text(
+            f"⚠️ Клиент <code>{client_name}</code> не найден.", parse_mode="HTML"
+        )
+
+    fpath = os.path.join(REPO_DIR, f"{client_name}.{ext}")
+    m = await update.message.reply_text("⏳ Удаление конфигов...")
+
+    try:
+        async with aiofiles.open(fpath, "r", encoding="utf-8") as f:
+            content = await f.read()
+
+        if ext == "json":
+            new_content, removed, remaining = remove_json_configs(content, indices)
+        else:
+            was_base64 = pending.get("was_base64", False)
+            new_content, removed, remaining = remove_text_configs(
+                content, indices, was_base64
+            )
+
+        fname = f"{client_name}.{ext}"
+        async with _git_lock:
+            await git_sync()
+            async with aiofiles.open(fpath, "w", encoding="utf-8") as f:
+                await f.write(new_content)
+            await git_commit_push(f"removeconfig {client_name}: -{removed}", [fname])
+
+        db[client_name]["size_bytes"] = len(new_content.encode("utf-8"))
+        db[client_name]["last_refresh"] = now_iso()
+        await save_db(db)
+
+        context.user_data.pop("removeconfig_pending", None)
+        await m.edit_text(
+            f"✅ Удалено {removed} конфига(ов) из <code>{client_name}</code>, "
+            f"осталось {remaining}",
+            parse_mode="HTML",
+        )
+        logger.info("removeconfig %s: removed=%d remaining=%d", client_name, removed, remaining)
+
+    except Exception as e:
+        logger.error("removeconfig %s: %s", client_name, e, exc_info=True)
+        context.user_data.pop("removeconfig_pending", None)
+        await m.edit_text(f"❌ Ошибка: {e}")
+
+
+@owner_only
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel any pending operation."""
+    cleared = []
+    for key in ["removeconfig_pending", "append_pending"]:
+        if context.user_data.pop(key, None):
+            cleared.append(key)
+    if cleared:
+        await update.message.reply_text("❌ Операция отменена.")
+    else:
+        await update.message.reply_text("ℹ️ Нет активных операций для отмены.")
+
+
 @owner_only
 async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка нового URL подписки."""
+    # Check for pending removeconfig input
+    if context.user_data.get("removeconfig_pending"):
+        return await handle_removeconfig_input(update, context)
+
     url = (update.message.text or "").strip()
 
     if not is_valid_url(url):
@@ -1809,6 +2276,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
         )
 
+    elif data.startswith("removeconfig_"):
+        client_name = data[len("removeconfig_"):]
+        await _send_removeconfig_list(update, context, client_name)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ЗАПУСК
@@ -1866,6 +2337,8 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("delete", cmd_delete))
+    app.add_handler(CommandHandler("removeconfig", cmd_removeconfig))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("import", cmd_import))
