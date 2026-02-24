@@ -84,7 +84,8 @@ get_system_info() {
     (( WORKERS > 2000  )) && WORKERS=2000
     (( RATE    > 500000)) && RATE=500000
 
-    MEM_LIMIT=$(( total_kb * 80 / 100 / 1024 ))   # 80 % of RAM in MiB
+    MEM_LIMIT=$(( total_kb * 80 / 100 / 1024 ))       # 80% of RAM in MiB — Go soft GC target
+    MEM_LIMIT_HARD=$(( total_kb * 90 / 100 / 1024 ))  # 90% of RAM in MiB — systemd hard ceiling
     echo -e "${GREEN}[OK]${NC} RAM: ${ram_gb}GB  Cores: ${cores}  Workers: ${WORKERS}  Rate: ${RATE}"
 }
 
@@ -789,6 +790,7 @@ func runScan(targets, countries []string, withVLESS bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("runScan panic: %v", r)
+			sendMsg(fmt.Sprintf("💥 Сканирование прервано из-за ошибки: %+v", r))
 		}
 		atomic.StoreInt32(&scan.stopped, 1)
 	}()
@@ -924,7 +926,8 @@ func runScan(targets, countries []string, withVLESS bool) {
 	}
 
 	semaphore := make(chan struct{}, wc)
-	resultsCh := make(chan Result, len(scan.openPorts)+1)
+	// Cap buffer to avoid pre-allocating huge amounts of memory for large scans
+	resultsCh := make(chan Result, min(len(scan.openPorts)+1, 1000))
 
 	// Ticker for progress updates during worker phase
 	workerTicker := time.NewTicker(5 * time.Second)
@@ -941,6 +944,18 @@ func runScan(targets, countries []string, withVLESS bool) {
 			case <-workerDone:
 				return
 			}
+		}
+	}()
+
+	// Drain results concurrently so workers are never blocked on a full channel
+	var collectWg sync.WaitGroup
+	collectWg.Add(1)
+	go func() {
+		defer collectWg.Done()
+		for r := range resultsCh {
+			scan.mu.Lock()
+			scan.results = append(scan.results, r)
+			scan.mu.Unlock()
 		}
 	}()
 
@@ -966,12 +981,7 @@ func runScan(targets, countries []string, withVLESS bool) {
 
 	wg.Wait()
 	close(resultsCh)
-
-	for r := range resultsCh {
-		scan.mu.Lock()
-		scan.results = append(scan.results, r)
-		scan.mu.Unlock()
-	}
+	collectWg.Wait()
 
 	sort.Slice(scan.results, func(i, j int) bool {
 		return scan.results[i].CFLatency < scan.results[j].CFLatency
@@ -1717,7 +1727,7 @@ Restart=always
 RestartSec=5
 User=root
 LimitNOFILE=1048576
-MemoryMax=${MEM_LIMIT}M
+MemoryMax=${MEM_LIMIT_HARD}M
 CPUAccounting=yes
 StandardOutput=journal
 StandardError=journal
