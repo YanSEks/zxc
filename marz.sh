@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Bot-Links-GitFlic Installer v9.0 (Smart JSON + Migration Edition)
+# Bot-Links-GitFlic Installer v9.1 (Smart JSON + Migration Edition)
 # + Автоопределение формата (JSON / текст)
 # + Инъекция правил блокировки (Block .tm, Ads, Porn) — идемпотентная
 # + Автообновление каждые N часов (APScheduler)
@@ -10,6 +10,11 @@
 # + /append — добавление конфигов к существующему клиенту
 # + /removeconfig — удаление отдельных конфигов из файла клиента
 # + /cancel — отмена текущей операции
+# + /rename — переименование клиента
+# + /seturl — обновление источника конфига
+# + /info — подробная информация о клиенте
+# + /refresh [name] — выборочное обновление одного клиента
+# + Подтверждение удаления через inline-кнопки
 # ============================================================================
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -224,7 +229,7 @@ apply_migration() {
 
 # ============================================================================
 echo ""
-info "=== Установка Bot-Links-GitFlic (v9.0 Smart JSON + Migration) ==="
+info "=== Установка Bot-Links-GitFlic (v9.1 Smart JSON + Migration) ==="
 echo ""
 
 # ==== 0. Проверки окружения ====
@@ -554,7 +559,7 @@ PYCONFIG
 
 # --- bot.py ---
 cat > "$DIR/bot.py" <<'PYBOT'
-"""Bot-Links-GitFlic v9.0 (Smart JSON + Migration Edition)
+"""Bot-Links-GitFlic v9.1 (Smart JSON + Migration Edition)
 
 Возможности:
   - Извлечение имени клиента из контента подписки (vless://#Name, vmess ps, JSON tag)
@@ -566,6 +571,11 @@ cat > "$DIR/bot.py" <<'PYBOT'
   - /append — добавление конфигов к существующему клиенту
   - /removeconfig — удаление отдельных конфигов из файла клиента
   - /cancel — отмена текущей операции
+  - /rename — переименование клиента (git mv + новая short-ссылка)
+  - /seturl — обновление источника конфига с немедленным re-fetch
+  - /info — подробная карточка клиента с action-кнопками
+  - /refresh [name] — выборочное обновление одного клиента
+  - Подтверждение удаления через inline-кнопки
 
 Архитектура refresh:
   1. Скачать все конфиги параллельно → dict в RAM
@@ -793,7 +803,7 @@ async def export_db() -> str:
     """Экспорт базы данных в JSON-строку для миграции."""
     db = await load_db()
     export_data = {
-        "version": "9.0",
+        "version": "9.1",
         "exported_at": now_iso(),
         "git_user": config.GIT_USER,
         "git_repo": config.GIT_REPO,
@@ -809,7 +819,7 @@ async def import_db(data: str) -> dict:
     parsed = json.loads(data)
 
     if "clients" in parsed:
-        # Формат экспорта v9.0
+        # Формат экспорта v9.1
         clients = parsed["clients"]
     elif isinstance(parsed, dict) and all(
         isinstance(v, dict) for v in parsed.values()
@@ -1429,9 +1439,12 @@ async def _do_append(client_name: str, new_configs: str, update: Update) -> None
 
             await git_commit_push(f"Append {added_count} configs to {client_name}", [fname])
 
-        db[client_name]["size_bytes"] = len(merged.encode("utf-8"))
-        db[client_name]["last_refresh"] = now_iso()
-        await save_db(db)
+        # Reload DB before saving to avoid overwriting concurrent changes
+        current_db = await load_db()
+        if client_name in current_db:
+            current_db[client_name]["size_bytes"] = len(merged.encode("utf-8"))
+            current_db[client_name]["last_refresh"] = now_iso()
+            await save_db(current_db)
 
         await m.edit_text(
             f"✅ <b>Конфиги добавлены!</b>\n\n"
@@ -1777,6 +1790,249 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  RENAME / SETURL / INFO / SINGLE REFRESH
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@owner_only
+async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /rename <old_name> <new_name>."""
+    if len(context.args) != 2:
+        return await update.message.reply_text(
+            "⚠️ Использование: <code>/rename &lt;old_name&gt; &lt;new_name&gt;</code>",
+            parse_mode="HTML",
+        )
+
+    old_name, raw_new = context.args
+    new_name = _sanitize_name(raw_new)
+
+    if not new_name:
+        return await update.message.reply_text(
+            "⚠️ Недопустимое новое имя. Используйте буквы, цифры, дефис, подчёркивание."
+        )
+
+    db = await load_db()
+    if old_name not in db:
+        return await update.message.reply_text(
+            f"⚠️ <code>{old_name}</code> не найден.\n/list", parse_mode="HTML"
+        )
+    if new_name in db:
+        return await update.message.reply_text(
+            f"⚠️ <code>{new_name}</code> уже существует.", parse_mode="HTML"
+        )
+
+    m = await update.message.reply_text("⏳ Переименование...")
+
+    ext = db[old_name].get("ext", "txt")
+    old_fname = f"{old_name}.{ext}"
+    new_fname = f"{new_name}.{ext}"
+
+    try:
+        async with _git_lock:
+            await git_sync()
+            old_fpath = os.path.join(REPO_DIR, old_fname)
+            if os.path.exists(old_fpath):
+                await run_cmd("git", "mv", old_fname, new_fname, cwd=REPO_DIR)
+                await run_cmd(
+                    "git", "commit", "-m", f"Rename {old_name} to {new_name}", cwd=REPO_DIR
+                )
+                await run_cmd("git", "push", "origin", config.GIT_BRANCH, cwd=REPO_DIR)
+    except Exception as e:
+        logger.error("git rename %s → %s failed: %s", old_name, new_name, e)
+        await m.edit_text(f"❌ Ошибка git при переименовании: {e}")
+        return
+
+    # Build new short URL for the renamed file
+    new_raw = build_raw_url(new_name, ext)
+    try:
+        async with aiohttp.ClientSession() as session:
+            new_short = await get_short(session, new_raw)
+    except Exception:
+        new_short = new_raw
+
+    # Reload DB and update atomically
+    current_db = await load_db()
+    if old_name in current_db:
+        entry = current_db.pop(old_name)
+        entry["short"] = new_short
+        current_db[new_name] = entry
+        await save_db(current_db)
+
+    await m.edit_text(
+        f"✅ <b>Переименовано!</b>\n\n"
+        f"📛 Было: <code>{old_name}</code>\n"
+        f"📛 Стало: <code>{new_name}</code>\n"
+        f"🔗 Новая ссылка: {new_short}",
+        parse_mode="HTML",
+    )
+    logger.info("Renamed: %s → %s", old_name, new_name)
+
+
+@owner_only
+async def cmd_seturl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /seturl <name> <new_url> — update source URL and re-fetch."""
+    if len(context.args) < 2:
+        return await update.message.reply_text(
+            "⚠️ Использование: <code>/seturl &lt;name&gt; &lt;new_url&gt;</code>",
+            parse_mode="HTML",
+        )
+
+    name = context.args[0]
+    new_url = context.args[1]
+
+    if not is_valid_url(new_url):
+        return await update.message.reply_text(
+            "⚠️ Некорректный URL (http:// или https://)."
+        )
+
+    db = await load_db()
+    if name not in db:
+        return await update.message.reply_text(
+            f"⚠️ <code>{name}</code> не найден.\n/list", parse_mode="HTML"
+        )
+
+    m = await update.message.reply_text("⏳ Обновляю источник и скачиваю конфиг...")
+
+    ext = db[name].get("ext", "txt")
+    fname = f"{name}.{ext}"
+    fpath = os.path.join(REPO_DIR, fname)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            raw_content = await download_content(session, new_url)
+            processed, _ = inject_rules(raw_content)
+
+        async with _git_lock:
+            await git_sync()
+            async with aiofiles.open(fpath, "w", encoding="utf-8") as f:
+                await f.write(processed)
+            await git_commit_push(f"Update source URL for {name}", [fname])
+
+        current_db = await load_db()
+        if name in current_db:
+            current_db[name]["original_url"] = new_url
+            current_db[name]["size_bytes"] = len(processed.encode("utf-8"))
+            current_db[name]["last_refresh"] = now_iso()
+            await save_db(current_db)
+
+        await m.edit_text(
+            f"✅ <b>Источник обновлён!</b>\n\n"
+            f"📛 Клиент: <code>{name}</code>\n"
+            f"🔗 Новый источник:\n<code>{new_url}</code>\n"
+            f"📏 Размер: {len(processed) // 1024} KB\n"
+            f"📤 Обновлено в GitFlic",
+            parse_mode="HTML",
+        )
+        logger.info("seturl: %s → %s", name, new_url)
+
+    except Exception as e:
+        logger.error("seturl %s: %s", name, e, exc_info=True)
+        await m.edit_text(f"❌ Ошибка: {e}")
+
+
+@owner_only
+async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /info <name> — show detailed info about a single client."""
+    if not context.args:
+        return await update.message.reply_text(
+            "⚠️ Использование: <code>/info &lt;name&gt;</code>",
+            parse_mode="HTML",
+        )
+
+    name = context.args[0]
+    db = await load_db()
+    if name not in db:
+        return await update.message.reply_text(
+            f"⚠️ <code>{name}</code> не найден.\n/list", parse_mode="HTML"
+        )
+
+    entry = db[name]
+    ext = entry.get("ext", "txt")
+    fpath = os.path.join(REPO_DIR, f"{name}.{ext}")
+
+    # Count configs if file is present
+    config_count = "—"
+    if os.path.exists(fpath):
+        try:
+            async with aiofiles.open(fpath, "r", encoding="utf-8") as f:
+                content = await f.read()
+            if ext == "json":
+                proxy_list, system_list = list_json_configs(content)
+                config_count = f"{len(proxy_list)} proxy + {len(system_list)} system"
+            else:
+                configs, _ = list_text_configs(content)
+                config_count = str(len(configs))
+        except Exception:
+            pass
+
+    name_source = entry.get("name_source", "?")
+    source_label = "👤 из конфига" if name_source == "config" else "🔀 сгенерировано"
+    size_bytes = entry.get("size_bytes", 0)
+    size_kb = size_bytes // 1024 if size_bytes else 0
+    raw_url = build_raw_url(name, ext)
+
+    text = (
+        f"ℹ️ <b>Клиент:</b> <code>{name}</code>\n\n"
+        f"📄 Формат: <code>{ext.upper()}</code>\n"
+        f"👤 Имя: {source_label}\n"
+        f"📊 Конфигов: <code>{config_count}</code>\n"
+        f"📏 Размер: <code>{size_kb} KB</code> ({size_bytes} байт)\n\n"
+        f"🔗 Ссылка: {entry.get('short', '—')}\n"
+        f"🌐 RAW:\n<code>{raw_url}</code>\n\n"
+        f"📎 Источник:\n<code>{entry.get('original_url', '—')}</code>\n\n"
+        f"📅 Создан: <code>{entry.get('created_at', '—')}</code>\n"
+        f"🔄 Обновлён: <code>{entry.get('last_refresh', '—')}</code>"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("➕ Дополнить", callback_data=f"append_{name}"),
+            InlineKeyboardButton("🔄 Обновить", callback_data=f"refresh_one_{name}"),
+        ],
+        [
+            InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_confirm_{name}"),
+        ],
+    ])
+
+    await update.message.reply_text(
+        text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=keyboard
+    )
+
+
+async def _refresh_single_client(name: str, entry: dict) -> dict:
+    """Refresh a single client: download, write to git, update DB."""
+    original_url = entry.get("original_url")
+    if not original_url:
+        return {"ok": False, "error": "нет original_url"}
+
+    ext = entry.get("ext", "txt")
+    fname = f"{name}.{ext}"
+    fpath = os.path.join(REPO_DIR, fname)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            raw_content = await download_content(session, original_url)
+            processed, _ = inject_rules(raw_content)
+
+        async with _git_lock:
+            await git_sync()
+            async with aiofiles.open(fpath, "w", encoding="utf-8") as f:
+                await f.write(processed)
+            await git_commit_push(f"Refresh {name}", [fname])
+
+        current_db = await load_db()
+        if name in current_db:
+            current_db[name]["last_refresh"] = now_iso()
+            current_db[name]["size_bytes"] = len(processed.encode("utf-8"))
+            await save_db(current_db)
+
+        return {"ok": True, "size": len(processed)}
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  ХЭНДЛЕРЫ
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1798,7 +2054,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     rules_status = "✅ включена" if config.INJECT_RULES else "❌ выключена"
     await update.message.reply_text(
-        f"🤖 <b>Bot-Links-GitFlic v9.0</b>\n\n"
+        f"🤖 <b>Bot-Links-GitFlic v9.1</b>\n\n"
         f"Отправьте URL подписки — бот:\n"
         f"  1. Скачает конфиг\n"
         f"  2. Определит имя клиента из контента\n"
@@ -1809,8 +2065,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏰ Автообновление: каждые {config.AUTO_REFRESH_HOURS}ч\n\n"
         f"<b>Команды:</b>\n"
         f"/list — список ссылок\n"
+        f"/info &lt;name&gt; — ℹ️ подробная информация\n"
         f"/delete &lt;name&gt; — удалить\n"
-        f"/refresh — обновить все конфиги\n"
+        f"/rename &lt;old&gt; &lt;new&gt; — переименовать\n"
+        f"/seturl &lt;name&gt; &lt;url&gt; — обновить источник\n"
+        f"/refresh [name] — 🔄 обновить (все или одного)\n"
         f"/append &lt;name&gt; — ➕ добавить конфиги к клиенту\n"
         f"/removeconfig &lt;name&gt; — 🗑 удалить отдельные конфиги\n"
         f"/cancel — ❌ отменить текущую операцию\n"
@@ -1953,7 +2212,29 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
         )
 
-    m = await update.message.reply_text("⏳ Удаление...")
+    ext = db[name].get("ext", "txt")
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🗑 Да, удалить", callback_data=f"delete_confirm_{name}"),
+            InlineKeyboardButton("❌ Отмена", callback_data="delete_cancel"),
+        ]
+    ])
+    await update.message.reply_text(
+        f"⚠️ <b>Удалить клиента?</b>\n\n"
+        f"📛 Имя: <code>{name}</code> [{ext.upper()}]\n"
+        f"🔗 Ссылка: {db[name].get('short', '—')}\n\n"
+        f"<i>Файл будет удалён из GitFlic. Отменить нельзя.</i>",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+async def _do_delete(name: str, query) -> None:
+    """Execute confirmed deletion: git rm + DB delete."""
+    db = await load_db()
+    if name not in db:
+        await query.edit_message_text(f"⚠️ <code>{name}</code> уже удалён.", parse_mode="HTML")
+        return
 
     ext = db[name].get("ext", "txt")
     fname = f"{name}.{ext}"
@@ -1965,25 +2246,24 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fpath = os.path.join(REPO_DIR, fname)
             if os.path.exists(fpath):
                 await run_cmd("git", "rm", "-f", fname, cwd=REPO_DIR)
-                await run_cmd(
-                    "git", "commit", "-m", f"Delete {name}", cwd=REPO_DIR
-                )
-                await run_cmd(
-                    "git", "push", "origin", config.GIT_BRANCH, cwd=REPO_DIR
-                )
+                await run_cmd("git", "commit", "-m", f"Delete {name}", cwd=REPO_DIR)
+                await run_cmd("git", "push", "origin", config.GIT_BRANCH, cwd=REPO_DIR)
             else:
                 git_file_existed = False
     except Exception as e:
         logger.error("git delete %s failed: %s", fname, e)
-        await m.edit_text(f"❌ Ошибка git при удалении: {e}")
-        return  # DON'T delete from DB if git failed
+        await query.edit_message_text(f"❌ Ошибка git при удалении: {e}", parse_mode="HTML")
+        return
 
-    # Only delete from DB after successful git operation
-    del db[name]
-    await save_db(db)
+    current_db = await load_db()
+    if name in current_db:
+        del current_db[name]
+        await save_db(current_db)
 
     note = "" if git_file_existed else "\n⚠️ <i>Файл в Git не найден, удалён из БД.</i>"
-    await m.edit_text(f"🗑 <code>{name}</code> удалён.{note}", parse_mode="HTML")
+    await query.edit_message_text(
+        f"🗑 <code>{name}</code> удалён.{note}", parse_mode="HTML"
+    )
     logger.info("Удалён: %s (git_existed=%s)", name, git_file_existed)
 
 
@@ -1992,6 +2272,28 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = await load_db()
     if not db:
         return await update.message.reply_text("📋 Нечего обновлять.")
+
+    # Selective refresh: /refresh <name>
+    if context.args:
+        name = context.args[0]
+        if name not in db:
+            return await update.message.reply_text(
+                f"⚠️ <code>{name}</code> не найден.\n/list", parse_mode="HTML"
+            )
+        m = await update.message.reply_text(f"⏳ Обновляю <code>{name}</code>...", parse_mode="HTML")
+        result = await _refresh_single_client(name, db[name])
+        if result["ok"]:
+            size_kb = result["size"] // 1024
+            await m.edit_text(
+                f"✅ <b>Обновлено!</b>\n\n"
+                f"📛 Клиент: <code>{name}</code>\n"
+                f"📏 Размер: {size_kb} KB\n"
+                f"📤 Обновлено в GitFlic",
+                parse_mode="HTML",
+            )
+        else:
+            await m.edit_text(f"❌ Ошибка обновления <code>{name}</code>: {result['error']}", parse_mode="HTML")
+        return
 
     keyboard = InlineKeyboardMarkup([
         [
@@ -2006,7 +2308,8 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔄 <b>Обновить всех клиентов?</b>\n\n"
         f"Записей: <b>{len(db)}</b>\n"
         f"Бот скачает конфиги, обработает правила и запушит в GitFlic.\n"
-        f"RAW-ссылки <b>не изменятся</b>.",
+        f"RAW-ссылки <b>не изменятся</b>.\n\n"
+        f"<i>Для обновления одного: /refresh &lt;name&gt;</i>",
         parse_mode="HTML",
         reply_markup=keyboard,
     )
@@ -2353,6 +2656,41 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         await cmd_removeconfig(update, context)
 
+    elif data.startswith("delete_confirm_"):
+        name = data[len("delete_confirm_"):]
+        await query.answer()
+        await query.edit_message_text(f"⏳ Удаляю <code>{name}</code>...", parse_mode="HTML")
+        await _do_delete(name, query)
+
+    elif data == "delete_cancel":
+        await query.answer("Отменено.")
+        await query.edit_message_text("❌ Удаление отменено.")
+
+    elif data.startswith("refresh_one_"):
+        name = data[len("refresh_one_"):]
+        db = await load_db()
+        if name not in db:
+            await query.answer("Клиент не найден!", show_alert=True)
+            return
+        await query.answer()
+        await query.edit_message_text(
+            f"⏳ Обновляю <code>{name}</code>...", parse_mode="HTML"
+        )
+        result = await _refresh_single_client(name, db[name])
+        if result["ok"]:
+            size_kb = result["size"] // 1024
+            await query.edit_message_text(
+                f"✅ <b>Обновлено!</b>\n\n"
+                f"📛 Клиент: <code>{name}</code>\n"
+                f"📏 Размер: {size_kb} KB\n"
+                f"📤 Обновлено в GitFlic",
+                parse_mode="HTML",
+            )
+        else:
+            await query.edit_message_text(
+                f"❌ Ошибка: {result['error']}", parse_mode="HTML"
+            )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ЗАПУСК
@@ -2416,6 +2754,9 @@ def main():
     app.add_handler(CommandHandler("append", cmd_append))
     app.add_handler(CommandHandler("removeconfig", cmd_removeconfig))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("rename", cmd_rename))
+    app.add_handler(CommandHandler("seturl", cmd_seturl))
+    app.add_handler(CommandHandler("info", cmd_info))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
     app.add_error_handler(error_handler)
@@ -2453,7 +2794,7 @@ info "Настройка systemd..."
 
 cat > "/etc/systemd/system/$SERVICE.service" <<EOF
 [Unit]
-Description=Bot-Links-GitFlic Telegram Bot (Smart JSON v9.0)
+Description=Bot-Links-GitFlic Telegram Bot (Smart JSON v9.1)
 Documentation=https://gitflic.ru/project/$GIT_USER/$GIT_REPO
 After=network-online.target
 Wants=network-online.target
@@ -2533,7 +2874,7 @@ fi
 # ==== 13. Итог ====
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-success "Установка Bot-Links-GitFlic v9.0 завершена! 🎉"
+success "Установка Bot-Links-GitFlic v9.1 завершена! 🎉"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 echo "  📂 Каталог:          $DIR"
@@ -2555,9 +2896,12 @@ echo "    cat $DIR/bot.log"
 echo ""
 echo "  ${BOLD}Команды бота в Telegram:${RESET}"
 echo "    /start    — 🤖 меню с кнопками"
-echo "    /refresh  — 🔄 обновить все конфиги клиентов"
+echo "    /refresh [name] — 🔄 обновить все или одного"
 echo "    /list     — 📋 список ссылок (с именами клиентов)"
-echo "    /delete   — 🗑  удалить запись"
+echo "    /info     — ℹ️ подробная информация о клиенте"
+echo "    /delete   — 🗑  удалить запись (с подтверждением)"
+echo "    /rename   — ✏️ переименовать клиента"
+echo "    /seturl   — 🔗 обновить источник конфига"
 echo "    /append   — ➕ добавить конфиги к клиенту"
 echo "    /removeconfig — 🗑 удалить отдельные конфиги"
 echo "    /cancel   — ❌ отменить текущую операцию"
