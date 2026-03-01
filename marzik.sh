@@ -3,7 +3,7 @@
 # Marzban Telegram Bot Deploy Script v4.0.2 (fully fixed)
 # Generates and deploys a fully-featured Marzban VPN panel management bot.
 #
-# Changelog vs v4.0.1:
+# Changelog vs v4.0.0 / v4.0.1:
 #   fix #1:  Argument parsing rewritten from for-loop to while/shift
 #   fix #2:  umask 077 scoped to subshell (no leak to subsequent files)
 #   fix #3:  .env values written via printf (no shell injection)
@@ -857,7 +857,7 @@ fi
 # ==== Summary ====
 echo ""
 echo "${BOLD}${GREEN}╔══════════════════════════════════════════════╗${RESET}"
-echo "${BOLD}${GREEN}║        Deployment Complete! v${VERSION}         ║${RESET}"
+echo "${BOLD}${GREEN}║     Deployment Complete! v${VERSION}        ║${RESET}"
 echo "${BOLD}${GREEN}╚══════════════════════════════════════════════╝${RESET}"
 echo ""
 info "App directory : $DIR"
