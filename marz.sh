@@ -7,7 +7,8 @@
 # + Извлечение имени клиента из контента подписки
 # + Расширение фиксируется при создании — RAW-ссылки навсегда стабильны
 # + Миграция на новый сервер с сохранением базы данных клиентов
-# + /append — добавление конфигов к существующему клиенту
+# + /append — добавление конфигов к существующему клиенту (авто-переименование)
+# + /clearappend — очистка сохранённых доп. конфигов клиента
 # + /removeconfig — удаление отдельных конфигов из файла клиента
 # + /cancel — отмена текущей операции
 # + /rename — переименование клиента
@@ -568,7 +569,8 @@ cat > "$DIR/bot.py" <<'PYBOT'
   - Автообновление каждые N часов через APScheduler с уведомлением в Telegram
   - Расширение фиксируется при создании — RAW-ссылки навсегда стабильны
   - Экспорт/импорт базы данных для миграции на новый сервер
-  - /append — добавление конфигов к существующему клиенту
+  - /append — добавление конфигов к существующему клиенту (авто-переименование в ClientName_N)
+  - /clearappend — очистка сохранённых доп. конфигов клиента
   - /removeconfig — удаление отдельных конфигов из файла клиента
   - /cancel — отмена текущей операции
   - /rename — переименование клиента (git mv + новая short-ссылка)
@@ -591,6 +593,7 @@ import io
 import json
 import logging
 import os
+import copy
 import re
 import shutil
 import time
@@ -1169,6 +1172,20 @@ async def _download_and_process(
         raw_content = await download_content(session, original_url)
         processed, _ = inject_rules(raw_content)
 
+        # Re-apply persisted appended configs
+        appended = entry.get("appended_configs", [])
+        if appended:
+            if ext == "json":
+                appended_json = json.dumps(
+                    [json.loads(a["content"]) for a in appended],
+                    indent=2,
+                    ensure_ascii=False,
+                )
+                processed, _ = merge_json_configs(processed, appended_json)
+            else:
+                appended_text = "\n".join(a["content"] for a in appended)
+                processed, _ = merge_text_configs(processed, appended_text)
+
         return {
             "name": name,
             "ok": True,
@@ -1335,6 +1352,53 @@ async def auto_refresh_job():
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+def rename_config_line(line: str, client_name: str, index: int) -> str:
+    """Rename a VPN config URI to use client_name + index as its display name.
+
+    Supports: vless://, trojan://, ss:// (fragment after #)
+              vmess:// (base64 JSON with "ps" field)
+    """
+    line = line.strip()
+    new_name = f"{client_name}_{index}"
+    encoded_name = urllib.parse.quote(new_name, safe="")
+
+    # vless://...#Name, trojan://...#Name, ss://...#Name
+    for proto in ("vless://", "trojan://", "ss://"):
+        if line.lower().startswith(proto):
+            if "#" in line:
+                base = line.rsplit("#", 1)[0]
+                return f"{base}#{encoded_name}"
+            else:
+                return f"{line}#{encoded_name}"
+
+    # vmess://base64 → decode JSON, change "ps", re-encode
+    if line.lower().startswith("vmess://"):
+        try:
+            payload = line[8:]
+            payload += "=" * (-len(payload) % 4)
+            decoded = b64.b64decode(payload).decode("utf-8", errors="ignore")
+            data = json.loads(decoded)
+            data["ps"] = new_name
+            new_json = json.dumps(data, ensure_ascii=False)
+            new_b64 = b64.b64encode(new_json.encode("utf-8")).decode("utf-8")
+            return f"vmess://{new_b64}"
+        except Exception:
+            if "#" in line:
+                base = line.rsplit("#", 1)[0]
+                return f"{base}#{encoded_name}"
+            return f"{line}#{encoded_name}"
+
+    # Unknown protocol — return as-is
+    return line
+
+
+def rename_json_outbound(outbound: dict, client_name: str, index: int) -> dict:
+    """Rename a JSON outbound's tag to client_name_index."""
+    ob = copy.deepcopy(outbound)
+    ob["tag"] = f"{client_name}_{index}"
+    return ob
+
+
 def _decode_if_base64(text: str) -> tuple[str, bool]:
     """Try to decode base64. Returns (decoded_text, was_base64)."""
     stripped = text.strip()
@@ -1412,6 +1476,10 @@ async def _do_append(client_name: str, new_configs: str, update: Update) -> None
     fname = f"{client_name}.{ext}"
     fpath = os.path.join(REPO_DIR, fname)
 
+    # Calculate starting index from existing appended configs
+    existing_appended = entry.get("appended_configs", [])
+    next_index = len(existing_appended) + 1
+
     m = await update.message.reply_text("⏳ Добавляю конфиги...")
 
     try:
@@ -1426,9 +1494,44 @@ async def _do_append(client_name: str, new_configs: str, update: Update) -> None
                 existing_content = await f.read()
 
             if ext == "json":
-                merged, added_count = merge_json_configs(existing_content, new_configs)
+                # For JSON: rename outbound tags before merging
+                new_stripped = new_configs.strip()
+                new_outbounds = []
+                if new_stripped.startswith("{"):
+                    new_data = json.loads(new_stripped)
+                    new_outbounds = new_data.get("outbounds", [])
+                elif new_stripped.startswith("["):
+                    new_outbounds = json.loads(new_stripped)
+
+                renamed_outbounds = [
+                    rename_json_outbound(ob, client_name, next_index + i)
+                    for i, ob in enumerate(new_outbounds)
+                ]
+                # Determine which tags already exist to filter actually-added items
+                existing_data = json.loads(existing_content)
+                existing_tags = {ob.get("tag", "") for ob in existing_data.get("outbounds", [])}
+                renamed_json = json.dumps(renamed_outbounds, indent=2, ensure_ascii=False)
+                merged, added_count = merge_json_configs(existing_content, renamed_json)
+                # Only store outbounds whose tags were not already in the file
+                added_items = [
+                    json.dumps(ob, ensure_ascii=False)
+                    for ob in renamed_outbounds
+                    if ob.get("tag", "") not in existing_tags
+                ]
             else:
-                merged, added_count = merge_text_configs(existing_content, new_configs)
+                # For text: rename each URI line
+                new_decoded, _ = _decode_if_base64(new_configs)
+                new_lines = [l.strip() for l in new_decoded.splitlines() if l.strip()]
+                renamed_lines = [
+                    rename_config_line(line, client_name, next_index + i)
+                    for i, line in enumerate(new_lines)
+                ]
+                renamed_text = "\n".join(renamed_lines)
+                merged, added_count = merge_text_configs(existing_content, renamed_text)
+                # Collect actually-added lines for storage (dedup against existing)
+                existing_decoded, _ = _decode_if_base64(existing_content)
+                existing_set = set(l.strip() for l in existing_decoded.splitlines() if l.strip())
+                added_items = [l for l in renamed_lines if l not in existing_set]
 
             if added_count == 0:
                 await m.edit_text("ℹ️ Нечего добавлять — все конфиги уже есть.")
@@ -1444,12 +1547,22 @@ async def _do_append(client_name: str, new_configs: str, update: Update) -> None
         if client_name in current_db:
             current_db[client_name]["size_bytes"] = len(merged.encode("utf-8"))
             current_db[client_name]["last_refresh"] = now_iso()
+            # Persist appended configs for re-apply after refresh
+            if "appended_configs" not in current_db[client_name]:
+                current_db[client_name]["appended_configs"] = []
+            for item in added_items:
+                current_db[client_name]["appended_configs"].append({
+                    "content": item,
+                    "added_at": now_iso(),
+                })
             await save_db(current_db)
 
         await m.edit_text(
             f"✅ <b>Конфиги добавлены!</b>\n\n"
             f"📛 Клиент: <code>{client_name}</code>\n"
             f"➕ Добавлено: <code>{added_count}</code>\n"
+            f"🏷 Переименованы в: <code>{client_name}_N</code>\n"
+            f"💾 Запомнены — при refresh будут восстановлены\n"
             f"📏 Размер: {len(merged) // 1024} KB\n"
             f"📤 Обновлено в GitFlic",
             parse_mode="HTML",
@@ -1789,6 +1902,42 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ℹ️ Нет активных операций для отмены.")
 
 
+@owner_only
+async def cmd_clearappend(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /clearappend <name> — clear stored appended configs for a client."""
+    if not context.args:
+        return await update.message.reply_text(
+            "⚠️ Использование: <code>/clearappend &lt;name&gt;</code>",
+            parse_mode="HTML",
+        )
+
+    name = context.args[0]
+    db = await load_db()
+    if name not in db:
+        return await update.message.reply_text(
+            f"⚠️ <code>{name}</code> не найден.\n/list",
+            parse_mode="HTML",
+        )
+
+    count = len(db[name].get("appended_configs", []))
+    if count == 0:
+        return await update.message.reply_text(
+            f"ℹ️ У клиента <code>{name}</code> нет сохранённых доп. конфигов.",
+            parse_mode="HTML",
+        )
+
+    db[name]["appended_configs"] = []
+    await save_db(db)
+    await update.message.reply_text(
+        f"🗑 <b>Очищено!</b>\n\n"
+        f"📛 Клиент: <code>{name}</code>\n"
+        f"➖ Удалено записей: <code>{count}</code>\n"
+        f"ℹ️ При следующем /refresh они не будут восстановлены.",
+        parse_mode="HTML",
+    )
+    logger.info("ClearAppend: %s, removed %d stored configs", name, count)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  RENAME / SETURL / INFO / SINGLE REFRESH
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2072,6 +2221,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/refresh [name] — 🔄 обновить (все или одного)\n"
         f"/append &lt;name&gt; — ➕ добавить конфиги к клиенту\n"
         f"/removeconfig &lt;name&gt; — 🗑 удалить отдельные конфиги\n"
+        f"/clearappend &lt;name&gt; — 🧹 очистить сохранённые доп. конфиги\n"
         f"/cancel — ❌ отменить текущую операцию\n"
         f"/status — статус бота\n"
         f"/export — экспорт БД для миграции\n"
@@ -2754,6 +2904,7 @@ def main():
     app.add_handler(CommandHandler("append", cmd_append))
     app.add_handler(CommandHandler("removeconfig", cmd_removeconfig))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("clearappend", cmd_clearappend))
     app.add_handler(CommandHandler("rename", cmd_rename))
     app.add_handler(CommandHandler("seturl", cmd_seturl))
     app.add_handler(CommandHandler("info", cmd_info))
@@ -2904,6 +3055,7 @@ echo "    /rename   — ✏️ переименовать клиента"
 echo "    /seturl   — 🔗 обновить источник конфига"
 echo "    /append   — ➕ добавить конфиги к клиенту"
 echo "    /removeconfig — 🗑 удалить отдельные конфиги"
+echo "    /clearappend — 🧹 очистить сохранённые доп. конфиги"
 echo "    /cancel   — ❌ отменить текущую операцию"
 echo "    /status   — 📊 статус + время след. обновления"
 echo "    /export   — 📦 экспорт БД для миграции"
