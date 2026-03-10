@@ -1158,7 +1158,7 @@ async def _download_and_process(
     name: str,
     entry: dict,
 ) -> dict:
-    """Скачать и обработать один конфиг В ПАМЯТЬ."""
+    """Скачать и обработать один конфиг В ПАМЯТЬ, затем переприменить сохранённые appended configs."""
     original_url = entry.get("original_url")
     if not original_url:
         return {"name": name, "ok": False, "error": "нет original_url"}
@@ -1169,12 +1169,27 @@ async def _download_and_process(
         raw_content = await download_content(session, original_url)
         processed, _ = inject_rules(raw_content)
 
+        # RE-APPLY APPENDED CONFIGS
+        appended = entry.get("appended_configs", [])
+        reapply_count = 0
+        if appended:
+            for item in appended:
+                extra_content = item.get("content", "")
+                if not extra_content:
+                    continue
+                if ext == "json":
+                    processed, added = merge_json_configs(processed, extra_content)
+                else:
+                    processed, added, _ = merge_text_configs(processed, extra_content)
+                reapply_count += added
+
         return {
             "name": name,
             "ok": True,
             "content": processed,
             "ext": ext,
             "size": len(processed),
+            "reapplied": reapply_count,
         }
     except Exception as e:
         return {"name": name, "ok": False, "error": str(e)}
@@ -1275,10 +1290,14 @@ async def _execute_refresh(
         await save_db(current_db)
 
         elapsed = round(time.monotonic() - start_time, 1)
+        total_reapplied = sum(r.get("reapplied", 0) for r in ok_results)
+        clients_with_reapplied = sum(1 for r in ok_results if r.get("reapplied", 0) > 0)
         return {
             "ok": len(ok_results),
             "fail": len(fail_results),
             "elapsed": elapsed,
+            "reapplied": total_reapplied,
+            "reapplied_clients": clients_with_reapplied,
             "errors": [
                 {"name": r["name"], "error": r["error"]}
                 for r in fail_results
@@ -1315,8 +1334,13 @@ async def auto_refresh_job():
             f"🔄 <b>Автообновление завершено</b>\n\n"
             f"✅ Успешно: <code>{result['ok']}</code>\n"
             f"❌ Ошибок: <code>{result['fail']}</code>\n"
-            f"⏱ Время: <code>{result['elapsed']}с</code>"
         )
+        if result.get("reapplied", 0) > 0:
+            report += (
+                f"♻️ Конфигов восстановлено: <code>{result['reapplied']}</code>"
+                f" (у {result['reapplied_clients']} клиентов)\n"
+            )
+        report += f"⏱ Время: <code>{result['elapsed']}с</code>"
         if result["errors"]:
             report += "\n\n<b>Ошибки:</b>\n"
             for e in result["errors"][:5]:
@@ -1351,8 +1375,8 @@ def _decode_if_base64(text: str) -> tuple[str, bool]:
     return stripped, False
 
 
-def merge_text_configs(existing: str, new_configs: str) -> tuple[str, int]:
-    """Merge URI-based configs. Returns (merged, added_count)."""
+def merge_text_configs(existing: str, new_configs: str) -> tuple[str, int, list[str]]:
+    """Merge URI-based configs. Returns (merged, added_count, added_lines)."""
     existing_decoded, was_base64 = _decode_if_base64(existing)
     new_decoded, _ = _decode_if_base64(new_configs)
 
@@ -1368,7 +1392,7 @@ def merge_text_configs(existing: str, new_configs: str) -> tuple[str, int]:
     if was_base64:
         merged = b64.b64encode(merged.encode()).decode()
 
-    return merged, len(added)
+    return merged, len(added), added
 
 
 def merge_json_configs(existing: str, new_configs: str) -> tuple[str, int]:
@@ -1401,7 +1425,7 @@ def merge_json_configs(existing: str, new_configs: str) -> tuple[str, int]:
 
 
 async def _do_append(client_name: str, new_configs: str, update: Update) -> None:
-    """Execute the append operation."""
+    """Execute the append operation and persist appended configs in DB."""
     db = await load_db()
     if client_name not in db:
         await update.message.reply_text(f"⚠️ Клиент <code>{client_name}</code> не найден.", parse_mode="HTML")
@@ -1425,10 +1449,11 @@ async def _do_append(client_name: str, new_configs: str, update: Update) -> None
             async with aiofiles.open(fpath, "r", encoding="utf-8") as f:
                 existing_content = await f.read()
 
+            added_lines: list[str] = []
             if ext == "json":
                 merged, added_count = merge_json_configs(existing_content, new_configs)
             else:
-                merged, added_count = merge_text_configs(existing_content, new_configs)
+                merged, added_count, added_lines = merge_text_configs(existing_content, new_configs)
 
             if added_count == 0:
                 await m.edit_text("ℹ️ Нечего добавлять — все конфиги уже есть.")
@@ -1442,6 +1467,20 @@ async def _do_append(client_name: str, new_configs: str, update: Update) -> None
         # Reload DB before saving to avoid overwriting concurrent changes
         current_db = await load_db()
         if client_name in current_db:
+            if "appended_configs" not in current_db[client_name]:
+                current_db[client_name]["appended_configs"] = []
+            timestamp = now_iso()
+            if ext != "json":
+                for line in added_lines:
+                    current_db[client_name]["appended_configs"].append({
+                        "content": line,
+                        "added_at": timestamp,
+                    })
+            else:
+                current_db[client_name]["appended_configs"].append({
+                    "content": new_configs.strip(),
+                    "added_at": timestamp,
+                })
             current_db[client_name]["size_bytes"] = len(merged.encode("utf-8"))
             current_db[client_name]["last_refresh"] = now_iso()
             await save_db(current_db)
@@ -1491,6 +1530,35 @@ async def cmd_append(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• JSON с outbounds\n"
         f"• Base64-кодированный список\n\n"
         f"Или /cancel для отмены.",
+        parse_mode="HTML",
+    )
+
+
+@owner_only
+async def cmd_clearappend(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Clear stored appended configs for a client."""
+    if not context.args:
+        return await update.message.reply_text(
+            "⚠️ Использование: <code>/clearappend &lt;name&gt;</code>", parse_mode="HTML"
+        )
+    name = context.args[0]
+    db = await load_db()
+    if name not in db:
+        return await update.message.reply_text(f"⚠️ <code>{name}</code> не найден.", parse_mode="HTML")
+
+    appended = db[name].get("appended_configs", [])
+    if not appended:
+        return await update.message.reply_text(
+            f"ℹ️ У <code>{name}</code> нет дополнительных конфигов.", parse_mode="HTML"
+        )
+
+    count = len(appended)
+    db[name]["appended_configs"] = []
+    await save_db(db)
+
+    await update.message.reply_text(
+        f"🗑 Очищено <code>{count}</code> доп. конфигов у <code>{name}</code>.\n"
+        f"При следующем /refresh они НЕ будут восстановлены.",
         parse_mode="HTML",
     )
 
@@ -1665,6 +1733,13 @@ async def _handle_removeconfig_selection(pending: dict, text: str, update: Updat
         if client_name in db:
             db[client_name]["size_bytes"] = len(new_content.encode("utf-8"))
             db[client_name]["last_refresh"] = now_iso()
+            # Remove deleted lines from appended_configs (text format)
+            if ext != "json" and "appended_configs" in db[client_name]:
+                removed_lines = {configs[i]["line"] for i in indices if i < len(configs)}
+                db[client_name]["appended_configs"] = [
+                    ac for ac in db[client_name]["appended_configs"]
+                    if ac.get("content", "") not in removed_lines
+                ]
             await save_db(db)
 
         await m.edit_text(
@@ -2014,6 +2089,19 @@ async def _refresh_single_client(name: str, entry: dict) -> dict:
             raw_content = await download_content(session, original_url)
             processed, _ = inject_rules(raw_content)
 
+        # RE-APPLY APPENDED CONFIGS
+        appended = entry.get("appended_configs", [])
+        reapply_count = 0
+        for item in appended:
+            extra_content = item.get("content", "")
+            if not extra_content:
+                continue
+            if ext == "json":
+                processed, added = merge_json_configs(processed, extra_content)
+            else:
+                processed, added, _ = merge_text_configs(processed, extra_content)
+            reapply_count += added
+
         async with _git_lock:
             await git_sync()
             async with aiofiles.open(fpath, "w", encoding="utf-8") as f:
@@ -2026,7 +2114,7 @@ async def _refresh_single_client(name: str, entry: dict) -> dict:
             current_db[name]["size_bytes"] = len(processed.encode("utf-8"))
             await save_db(current_db)
 
-        return {"ok": True, "size": len(processed)}
+        return {"ok": True, "size": len(processed), "reapplied": reapply_count}
 
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -2072,6 +2160,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/refresh [name] — 🔄 обновить (все или одного)\n"
         f"/append &lt;name&gt; — ➕ добавить конфиги к клиенту\n"
         f"/removeconfig &lt;name&gt; — 🗑 удалить отдельные конфиги\n"
+        f"/clearappend &lt;name&gt; — 🧹 очистить память доп. конфигов\n"
         f"/cancel — ❌ отменить текущую операцию\n"
         f"/status — статус бота\n"
         f"/export — экспорт БД для миграции\n"
@@ -2595,6 +2684,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 Всего: <code>{result['ok'] + result['fail']}</code>\n"
             f"✅ Успешно: <code>{result['ok']}</code>\n"
             f"❌ Ошибок: <code>{result['fail']}</code>\n"
+        )
+        if result.get("reapplied", 0) > 0:
+            report += (
+                f"♻️ Конфигов восстановлено: <code>{result['reapplied']}</code>"
+                f" (у {result['reapplied_clients']} клиентов)\n"
+            )
+        report += (
             f"⏱ Время: <code>{result['elapsed']}с</code>\n\n"
             f"<i>RAW-ссылки не изменились.</i>"
         )
@@ -2754,6 +2850,7 @@ def main():
     app.add_handler(CommandHandler("append", cmd_append))
     app.add_handler(CommandHandler("removeconfig", cmd_removeconfig))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("clearappend", cmd_clearappend))
     app.add_handler(CommandHandler("rename", cmd_rename))
     app.add_handler(CommandHandler("seturl", cmd_seturl))
     app.add_handler(CommandHandler("info", cmd_info))
@@ -2904,6 +3001,7 @@ echo "    /rename   — ✏️ переименовать клиента"
 echo "    /seturl   — 🔗 обновить источник конфига"
 echo "    /append   — ➕ добавить конфиги к клиенту"
 echo "    /removeconfig — 🗑 удалить отдельные конфиги"
+echo "    /clearappend — 🧹 очистить память доп. конфигов"
 echo "    /cancel   — ❌ отменить текущую операцию"
 echo "    /status   — 📊 статус + время след. обновления"
 echo "    /export   — 📦 экспорт БД для миграции"
