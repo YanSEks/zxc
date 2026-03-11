@@ -9,6 +9,8 @@
 # + Миграция на новый сервер с сохранением базы данных клиентов
 # + /append — добавление конфигов к существующему клиенту
 # + /removeconfig — удаление отдельных конфигов из файла клиента
+# + /appendall — добавление конфигов сразу всем клиентам
+# + /removeconfigall — удаление конфигов сразу у всех клиентов
 # + /cancel — отмена текущей операции
 # + /rename — переименование клиента
 # + /seturl — обновление источника конфига
@@ -1495,6 +1497,108 @@ async def cmd_append(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def _do_appendall(new_configs: str, message) -> None:
+    """Execute the append-all operation: add configs to every client."""
+    db = await load_db()
+    if not db:
+        await message.reply_text("ℹ️ Нет клиентов в базе данных.")
+        return
+
+    m = await message.reply_text(f"⏳ Добавляю конфиги всем {len(db)} клиентам...")
+
+    total_added = 0
+    updated_clients = 0
+    errors = []
+    changed_files = []
+
+    try:
+        async with _git_lock:
+            await git_sync()
+
+            for client_name, entry in db.items():
+                ext = entry.get("ext", "txt")
+                fname = f"{client_name}.{ext}"
+                fpath = os.path.join(REPO_DIR, fname)
+
+                try:
+                    if not os.path.exists(fpath):
+                        errors.append({"name": client_name, "error": "файл не найден"})
+                        continue
+
+                    async with aiofiles.open(fpath, "r", encoding="utf-8") as f:
+                        existing_content = await f.read()
+
+                    if ext == "json":
+                        merged, added_count = merge_json_configs(existing_content, new_configs)
+                    else:
+                        merged, added_count = merge_text_configs(existing_content, new_configs)
+
+                    if added_count > 0:
+                        async with aiofiles.open(fpath, "w", encoding="utf-8") as f:
+                            await f.write(merged)
+                        entry["size_bytes"] = len(merged.encode("utf-8"))
+                        entry["last_refresh"] = now_iso()
+                        total_added += added_count
+                        updated_clients += 1
+                        changed_files.append(fname)
+                        logger.info("AppendAll: %s +%d configs", client_name, added_count)
+
+                except Exception as e:
+                    logger.error("AppendAll %s: %s", client_name, e, exc_info=True)
+                    errors.append({"name": client_name, "error": str(e)})
+
+            if changed_files:
+                await git_commit_push(
+                    f"AppendAll: +{total_added} configs to {updated_clients} clients",
+                    changed_files,
+                )
+
+        if changed_files:
+            await save_db(db)
+
+        if total_added == 0 and not errors:
+            await m.edit_text("ℹ️ Нечего добавлять — все конфиги уже есть у всех клиентов.")
+            return
+
+        report = (
+            f"✅ <b>Массовое добавление завершено!</b>\n\n"
+            f"👥 Клиентов обновлено: <code>{updated_clients}</code> / <code>{len(db)}</code>\n"
+            f"➕ Конфигов добавлено: <code>{total_added}</code>\n"
+        )
+        if errors:
+            report += f"❌ Ошибок: <code>{len(errors)}</code>\n\n<b>Ошибки:</b>\n"
+            for e in errors[:10]:
+                report += f"• <code>{e['name']}</code>: {e['error']}\n"
+
+        await m.edit_text(report, parse_mode="HTML")
+        logger.info("AppendAll done: %d clients, +%d configs", updated_clients, total_added)
+
+    except Exception as e:
+        logger.error("AppendAll: %s", e, exc_info=True)
+        await m.edit_text(f"❌ Ошибка: {e}")
+
+
+@owner_only
+async def cmd_appendall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /appendall — add configs to all clients at once."""
+    db = await load_db()
+    if not db:
+        return await update.message.reply_text("ℹ️ Нет клиентов в базе данных.")
+
+    context.user_data["appendall_pending"] = {"created_at": time.monotonic()}
+
+    await update.message.reply_text(
+        f"📝 <b>Массовое добавление конфигов</b>\n\n"
+        f"Конфиги будут добавлены <b>всем {len(db)} клиентам</b>.\n\n"
+        f"Отправьте конфиги для добавления:\n"
+        f"• URI-строки (vless://, vmess://, trojan://, ss://)\n"
+        f"• JSON с outbounds\n"
+        f"• Base64-кодированный список\n\n"
+        f"Или /cancel для отмены.",
+        parse_mode="HTML",
+    )
+
+
 def parse_line_selection(text: str, max_num: int) -> list[int]:
     """Parse '1 3-5 8' or 'all' into sorted 0-based indices."""
     text = text.strip().lower()
@@ -1776,13 +1880,169 @@ async def cmd_removeconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
 
+def remove_text_configs_by_value(content: str, uris_to_remove: set) -> tuple[str, int]:
+    """Remove lines that exactly match provided URIs. Returns (new_content, removed_count)."""
+    decoded, was_base64 = _decode_if_base64(content)
+    lines = [l.strip() for l in decoded.splitlines() if l.strip()]
+    remaining = [l for l in lines if l not in uris_to_remove]
+    removed = len(lines) - len(remaining)
+    result = "\n".join(remaining) + "\n" if remaining else ""
+    if was_base64 and result:
+        result = b64.b64encode(result.encode()).decode()
+    return result, removed
+
+
+def remove_json_configs_by_tags(content: str, tags_to_remove: set) -> tuple[str, int]:
+    """Remove outbounds whose tag is in tags_to_remove. Returns (new_content, removed_count)."""
+    data = json.loads(content)
+    outbounds = data.get("outbounds", [])
+    new_outbounds = [ob for ob in outbounds if ob.get("tag", "") not in tags_to_remove]
+    removed = len(outbounds) - len(new_outbounds)
+    data["outbounds"] = new_outbounds
+    result, _ = inject_rules(json.dumps(data, indent=2, ensure_ascii=False))
+    return result, removed
+
+
+async def _do_removeconfigall(configs_to_remove: str, message) -> None:
+    """Execute the remove-all operation: remove matching configs from every client."""
+    db = await load_db()
+    if not db:
+        await message.reply_text("ℹ️ Нет клиентов в базе данных.")
+        return
+
+    # Parse provided configs into a set of URIs and a set of JSON tags
+    decoded, _ = _decode_if_base64(configs_to_remove)
+    uris_to_remove = {l.strip() for l in decoded.splitlines() if l.strip()}
+
+    tags_to_remove: set[str] = set()
+    stripped = configs_to_remove.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            if stripped.startswith("{"):
+                obj = json.loads(stripped)
+                outbounds = obj.get("outbounds", [])
+            else:
+                outbounds = json.loads(stripped)
+            tags_to_remove = {ob.get("tag", "") for ob in outbounds if ob.get("tag")}
+        except Exception:
+            pass
+
+    # Fall back to using URI lines as tags for JSON clients.
+    # This allows passing plain URI strings to also remove outbounds from JSON
+    # clients if their tag happens to match one of the provided URIs.
+    if not tags_to_remove:
+        tags_to_remove = uris_to_remove
+
+    m = await message.reply_text(f"⏳ Удаляю конфиги у всех {len(db)} клиентов...")
+
+    total_removed = 0
+    affected_clients = 0
+    errors = []
+    changed_files = []
+
+    try:
+        async with _git_lock:
+            await git_sync()
+
+            for client_name, entry in db.items():
+                ext = entry.get("ext", "txt")
+                fname = f"{client_name}.{ext}"
+                fpath = os.path.join(REPO_DIR, fname)
+
+                try:
+                    if not os.path.exists(fpath):
+                        errors.append({"name": client_name, "error": "файл не найден"})
+                        continue
+
+                    async with aiofiles.open(fpath, "r", encoding="utf-8") as f:
+                        existing_content = await f.read()
+
+                    if ext == "json":
+                        new_content, removed = remove_json_configs_by_tags(existing_content, tags_to_remove)
+                    else:
+                        new_content, removed = remove_text_configs_by_value(existing_content, uris_to_remove)
+
+                    if removed > 0:
+                        async with aiofiles.open(fpath, "w", encoding="utf-8") as f:
+                            await f.write(new_content)
+                        entry["size_bytes"] = len(new_content.encode("utf-8"))
+                        entry["last_refresh"] = now_iso()
+                        total_removed += removed
+                        affected_clients += 1
+                        changed_files.append(fname)
+                        logger.info("RemoveConfigAll: %s -%d configs", client_name, removed)
+
+                except Exception as e:
+                    logger.error("RemoveConfigAll %s: %s", client_name, e, exc_info=True)
+                    errors.append({"name": client_name, "error": str(e)})
+
+            if changed_files:
+                await git_commit_push(
+                    f"RemoveConfigAll: -{total_removed} configs from {affected_clients} clients",
+                    changed_files,
+                )
+
+        if changed_files:
+            await save_db(db)
+
+        if total_removed == 0 and not errors:
+            await m.edit_text("ℹ️ Ни у одного клиента не найдено совпадений для удаления.")
+            return
+
+        report = (
+            f"✅ <b>Массовое удаление завершено!</b>\n\n"
+            f"👥 Клиентов затронуто: <code>{affected_clients}</code> / <code>{len(db)}</code>\n"
+            f"🗑 Конфигов удалено: <code>{total_removed}</code>\n"
+        )
+        if errors:
+            report += f"❌ Ошибок: <code>{len(errors)}</code>\n\n<b>Ошибки:</b>\n"
+            for e in errors[:10]:
+                report += f"• <code>{e['name']}</code>: {e['error']}\n"
+
+        await m.edit_text(report, parse_mode="HTML")
+        logger.info("RemoveConfigAll done: %d clients, -%d configs", affected_clients, total_removed)
+
+    except Exception as e:
+        logger.error("RemoveConfigAll: %s", e, exc_info=True)
+        await m.edit_text(f"❌ Ошибка: {e}")
+
+
+@owner_only
+async def cmd_removeconfigall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /removeconfigall — remove matching configs from all clients at once."""
+    db = await load_db()
+    if not db:
+        return await update.message.reply_text("ℹ️ Нет клиентов в базе данных.")
+
+    context.user_data["removeconfigall_pending"] = {"created_at": time.monotonic()}
+
+    await update.message.reply_text(
+        f"🗑 <b>Массовое удаление конфигов</b>\n\n"
+        f"Конфиги будут удалены у <b>всех {len(db)} клиентов</b>.\n\n"
+        f"Отправьте конфиги для удаления:\n"
+        f"• URI-строки (vless://, vmess://, trojan://, ss://)\n"
+        f"• JSON с outbounds (удаляются по тегу)\n"
+        f"• Base64-кодированный список\n\n"
+        f"⚠️ <b>Внимание:</b> операция необратима!\n"
+        f"Или /cancel для отмены.",
+        parse_mode="HTML",
+    )
+
+
 @owner_only
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel any pending operation."""
+    pending_keys = {
+        "removeconfig_pending": "removeconfig",
+        "append_pending": "append",
+        "appendall_pending": "appendall",
+        "removeconfigall_pending": "removeconfigall",
+        "removeconfigall_data": "removeconfigall",
+    }
     cleared = []
-    for key in ["removeconfig_pending", "append_pending"]:
-        if context.user_data.pop(key, None):
-            cleared.append(key.replace("_pending", ""))
+    for key, label in pending_keys.items():
+        if context.user_data.pop(key, None) and label not in cleared:
+            cleared.append(label)
     if cleared:
         await update.message.reply_text("❌ Операция отменена.")
     else:
@@ -2072,6 +2332,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/refresh [name] — 🔄 обновить (все или одного)\n"
         f"/append &lt;name&gt; — ➕ добавить конфиги к клиенту\n"
         f"/removeconfig &lt;name&gt; — 🗑 удалить отдельные конфиги\n"
+        f"/appendall — ➕➕ добавить конфиги сразу всем клиентам\n"
+        f"/removeconfigall — 🗑🗑 удалить конфиги у всех клиентов\n"
         f"/cancel — ❌ отменить текущую операцию\n"
         f"/status — статус бота\n"
         f"/export — экспорт БД для миграции\n"
@@ -2434,6 +2696,47 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _handle_removeconfig_selection(pending_remove, text, update)
             return
 
+    # Check for pending appendall
+    pending_appendall = context.user_data.get("appendall_pending")
+    if pending_appendall:
+        if time.monotonic() - pending_appendall.get("created_at", 0) > 300:
+            context.user_data.pop("appendall_pending", None)
+        else:
+            context.user_data.pop("appendall_pending", None)
+            await _do_appendall(text, update.message)
+            return
+
+    # Check for pending removeconfigall (show confirmation)
+    pending_removeconfigall = context.user_data.get("removeconfigall_pending")
+    if pending_removeconfigall:
+        if time.monotonic() - pending_removeconfigall.get("created_at", 0) > 300:
+            context.user_data.pop("removeconfigall_pending", None)
+        else:
+            context.user_data.pop("removeconfigall_pending", None)
+            db = await load_db()
+            context.user_data["removeconfigall_data"] = {
+                "configs": text,
+                "created_at": time.monotonic(),
+            }
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        f"✅ Да, удалить у всех {len(db)} клиентов",
+                        callback_data="removeconfigall_confirm",
+                    ),
+                    InlineKeyboardButton("❌ Отмена", callback_data="removeconfigall_cancel"),
+                ]
+            ])
+            await update.message.reply_text(
+                f"⚠️ <b>Подтверждение массового удаления</b>\n\n"
+                f"Конфиги будут удалены у <b>всех {len(db)} клиентов</b>.\n"
+                f"Это действие необратимо!\n\n"
+                f"Продолжить?",
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            return
+
     # Check reply to saved message (append via reply)
     reply = update.message.reply_to_message
     if reply and reply.message_id in _save_msg_to_client and not is_valid_url(text):
@@ -2666,6 +2969,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Отменено.")
         await query.edit_message_text("❌ Удаление отменено.")
 
+    elif data == "removeconfigall_confirm":
+        await query.answer()
+        pending_data = context.user_data.pop("removeconfigall_data", None)
+        if not pending_data:
+            await query.edit_message_text("❌ Данные устарели. Повторите /removeconfigall")
+            return
+        if time.monotonic() - pending_data.get("created_at", 0) > 300:
+            await query.edit_message_text("❌ Время ожидания истекло. Повторите /removeconfigall")
+            return
+        await query.edit_message_text("⏳ Выполняю массовое удаление...", parse_mode="HTML")
+        await _do_removeconfigall(pending_data["configs"], query.message)
+
+    elif data == "removeconfigall_cancel":
+        context.user_data.pop("removeconfigall_data", None)
+        await query.answer("Отменено.")
+        await query.edit_message_text("❌ Массовое удаление отменено.")
+
     elif data.startswith("refresh_one_"):
         name = data[len("refresh_one_"):]
         db = await load_db()
@@ -2753,6 +3073,8 @@ def main():
     app.add_handler(CommandHandler("import", cmd_import))
     app.add_handler(CommandHandler("append", cmd_append))
     app.add_handler(CommandHandler("removeconfig", cmd_removeconfig))
+    app.add_handler(CommandHandler("appendall", cmd_appendall))
+    app.add_handler(CommandHandler("removeconfigall", cmd_removeconfigall))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("rename", cmd_rename))
     app.add_handler(CommandHandler("seturl", cmd_seturl))
@@ -2904,6 +3226,8 @@ echo "    /rename   — ✏️ переименовать клиента"
 echo "    /seturl   — 🔗 обновить источник конфига"
 echo "    /append   — ➕ добавить конфиги к клиенту"
 echo "    /removeconfig — 🗑 удалить отдельные конфиги"
+echo "    /appendall — ➕➕ добавить конфиги сразу всем клиентам"
+echo "    /removeconfigall — 🗑🗑 удалить конфиги у всех клиентов"
 echo "    /cancel   — ❌ отменить текущую операцию"
 echo "    /status   — 📊 статус + время след. обновления"
 echo "    /export   — 📦 экспорт БД для миграции"
