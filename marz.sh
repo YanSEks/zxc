@@ -1346,6 +1346,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/list — список ссылок\n"
         f"/delete &lt;name&gt; — удалить\n"
         f"/append &lt;name&gt; — добавить конфиги к клиенту\n"
+        f"/appendall — ➕ добавить конфиги всем клиентам\n"
+        f"/clearall — 🗑 сбросить доп. конфиги всем клиентам\n"
         f"/refresh — обновить все конфиги\n"
         f"/status — статус бота\n"
         f"/export — экспорт БД для миграции\n"
@@ -1831,6 +1833,160 @@ async def handle_append_input(
         await m.edit_text(f"❌ Ошибка при добавлении: {e}")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  APPENDALL — BULK APPEND TO ALL CLIENTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@owner_only
+async def cmd_appendall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /appendall command — sets wait state for bulk append."""
+    db = await load_db()
+    if not db:
+        return await update.message.reply_text("📋 Нет клиентов для дополнения.")
+
+    context.user_data["appendall_pending"] = True
+    await update.message.reply_text(
+        f"📤 <b>Дополнение всех клиентов ({len(db)} шт.)</b>\n\n"
+        f"Отправьте конфиги для добавления всем:\n"
+        f"• URI-строки (vless://, vmess://, trojan://, ss://)\n"
+        f"• JSON с outbounds\n\n"
+        f"<i>Для отмены отправьте /cancel</i>",
+        parse_mode="HTML",
+    )
+
+
+async def _do_appendall(
+    new_configs: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Execute bulk append — add same configs to all users in one git commit."""
+    context.user_data.pop("appendall_pending", None)
+
+    db = await load_db()
+    if not db:
+        return await update.message.reply_text("📋 Нет клиентов.")
+
+    m = await update.message.reply_text(
+        f"⏳ Добавляю конфиги {len(db)} клиентам..."
+    )
+
+    ok_count = 0
+    skipped_count = 0
+    errors: list[str] = []
+    changed_files: list[tuple[str, str, int]] = []  # (name, fname, new_size)
+
+    try:
+        async with _git_lock:
+            await git_sync()
+
+            for name, entry in db.items():
+                ext = entry.get("ext", "txt")
+                fname = f"{name}.{ext}"
+                fpath = os.path.join(REPO_DIR, fname)
+
+                if not os.path.exists(fpath):
+                    errors.append(f"{name}: файл не найден")
+                    continue
+
+                try:
+                    async with aiofiles.open(fpath, "r", encoding="utf-8") as f:
+                        existing_content = await f.read()
+
+                    if ext == "json":
+                        try:
+                            merged, added = merge_json_configs(existing_content, new_configs)
+                        except (json.JSONDecodeError, ValueError):
+                            merged, added = merge_text_configs(existing_content, new_configs)
+                    else:
+                        merged, added = merge_text_configs(existing_content, new_configs)
+
+                    if added > 0:
+                        async with aiofiles.open(fpath, "w", encoding="utf-8") as f:
+                            await f.write(merged)
+                        changed_files.append((name, fname, len(merged.encode("utf-8"))))
+                        ok_count += 1
+                    else:
+                        skipped_count += 1
+
+                except Exception as e:
+                    logger.warning("appendall %s: %s", name, e)
+                    errors.append(f"{name}: {e}")
+
+            if changed_files:
+                await git_commit_push(
+                    f"Appendall to {len(changed_files)} clients ({now_iso()})",
+                    [fname for _, fname, _ in changed_files],
+                )
+
+        # Update DB for changed clients
+        if changed_files:
+            current_db = await load_db()
+            ts = now_iso()
+            for name, _fname, new_size in changed_files:
+                if name in current_db:
+                    current_db[name]["size_bytes"] = new_size
+                    current_db[name]["last_refresh"] = ts
+            await save_db(current_db)
+
+        report = (
+            f"✅ <b>Дополнение завершено!</b>\n\n"
+            f"➕ Обновлено клиентов: <code>{ok_count}</code>\n"
+            f"⏭ Без изменений: <code>{skipped_count}</code>\n"
+            f"❌ Ошибок: <code>{len(errors)}</code>"
+        )
+        if errors:
+            report += "\n\n<b>Ошибки:</b>\n"
+            for err in errors[:5]:
+                report += f"• {err}\n"
+            if len(errors) > 5:
+                report += f"<i>…и ещё {len(errors) - 5}</i>\n"
+
+        await m.edit_text(report, parse_mode="HTML")
+        logger.info(
+            "Appendall: ok=%d skipped=%d errors=%d",
+            ok_count, skipped_count, len(errors),
+        )
+
+    except Exception as e:
+        logger.error("Appendall: %s", e, exc_info=True)
+        await m.edit_text(f"❌ Ошибка: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CLEARALL — RESET ALL CLIENTS TO ORIGINAL (RE-DOWNLOAD)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@owner_only
+async def cmd_clearall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /clearall — confirms then re-downloads all clients from original URLs."""
+    db = await load_db()
+    if not db:
+        return await update.message.reply_text("📋 Нет клиентов.")
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                f"✅ Да, сбросить {len(db)} шт.",
+                callback_data="clearall_go",
+            ),
+            InlineKeyboardButton("❌ Отмена", callback_data="clearall_cancel"),
+        ]
+    ])
+    await update.message.reply_text(
+        f"⚠️ <b>Сброс конфигов всех клиентов</b>\n\n"
+        f"Это перезагрузит конфиги <b>{len(db)}</b> клиентов\n"
+        f"из их исходных URL (original_url).\n\n"
+        f"Все конфиги, добавленные через /append и /appendall,\n"
+        f"<b>будут удалены</b>.\n\n"
+        f"Продолжить?",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
 @owner_only
 async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка нового URL подписки."""
@@ -1842,7 +1998,12 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_append_input(update, context, append_target)
         return
 
-    # 2. Inline-flow: ответ на "✅ Сохранено" — append без команды
+    # 2. Если пользователь в режиме ожидания bulk-append для всех
+    if context.user_data.get("appendall_pending"):
+        await _do_appendall(text, update, context)
+        return
+
+    # 3. Inline-flow: ответ на "✅ Сохранено" — append без команды
     reply_msg = update.message.reply_to_message
     if reply_msg and not is_valid_url(text):
         client_name = _save_msg_to_client.get(reply_msg.message_id)
@@ -2061,6 +2222,39 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
         )
 
+    elif data == "clearall_go":
+        await query.answer()
+
+        db = await load_db()
+        if not db:
+            return await query.edit_message_text("📋 Нечего сбрасывать.")
+
+        async def notify(text):
+            try:
+                await query.edit_message_text(text, parse_mode="HTML")
+            except Exception:
+                pass
+
+        result = await _execute_refresh(db, notify_callback=notify, source="manual")
+
+        report = (
+            f"✅ <b>Сброс завершён!</b>\n\n"
+            f"🔄 Перезагружено: <code>{result['ok']}</code>\n"
+            f"❌ Ошибок: <code>{result['fail']}</code>\n"
+            f"⏱ Время: <code>{result['elapsed']}с</code>\n\n"
+            f"<i>Все доп. конфиги удалены, RAW-ссылки не изменились.</i>"
+        )
+        if result["errors"]:
+            report += "\n\n<b>Ошибки:</b>\n"
+            for e in result["errors"][:10]:
+                report += f"• <code>{e['name']}</code>: {e['error']}\n"
+
+        await query.edit_message_text(report, parse_mode="HTML")
+
+    elif data == "clearall_cancel":
+        await query.answer("Отменено.")
+        await query.edit_message_text("❌ Сброс отменён.")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ЗАПУСК
@@ -2119,6 +2313,8 @@ def main():
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("append", cmd_append))
+    app.add_handler(CommandHandler("appendall", cmd_appendall))
+    app.add_handler(CommandHandler("clearall", cmd_clearall))
     app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("import", cmd_import))
@@ -2260,15 +2456,17 @@ echo "    journalctl -u $SERVICE -f"
 echo "    cat $DIR/bot.log"
 echo ""
 echo "  ${BOLD}Команды бота в Telegram:${RESET}"
-echo "    /start    — 🤖 меню с кнопками"
-echo "    /refresh  — 🔄 обновить все конфиги клиентов"
-echo "    /list     — 📋 список ссылок (с именами клиентов)"
-echo "    /delete   — 🗑  удалить запись"
-echo "    /append   — ➕ добавить конфиги к клиенту"
-echo "    /status   — 📊 статус + время след. обновления"
-echo "    /export   — 📦 экспорт БД для миграции"
-echo "    /import   — 📥 импорт БД (ответом на файл)"
-echo "    /help     — ❓ справка"
+echo "    /start     — 🤖 меню с кнопками"
+echo "    /refresh   — 🔄 обновить все конфиги клиентов"
+echo "    /list      — 📋 список ссылок (с именами клиентов)"
+echo "    /delete    — 🗑  удалить запись"
+echo "    /append    — ➕ добавить конфиги к клиенту"
+echo "    /appendall — ➕ добавить конфиги ВСЕМ клиентам"
+echo "    /clearall  — 🗑 сбросить доп. конфиги ВСЕХ клиентов"
+echo "    /status    — 📊 статус + время след. обновления"
+echo "    /export    — 📦 экспорт БД для миграции"
+echo "    /import    — 📥 импорт БД (ответом на файл)"
+echo "    /help      — ❓ справка"
 echo ""
 echo "  ${BOLD}Миграция на новый сервер:${RESET}"
 echo "    Вариант 1 (через Telegram):"
