@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Bot-Links-GitFlic Installer v9.1 (Smart JSON + Migration Edition)
+# Bot-Links-GitFlic Installer v9.2 (Smart JSON + Migration Edition)
 # + Автоопределение формата (JSON / текст)
 # + Инъекция правил блокировки (Block .tm, Ads, Porn) — идемпотентная
 # + Автообновление каждые N часов (APScheduler)
@@ -231,7 +231,7 @@ apply_migration() {
 
 # ============================================================================
 echo ""
-info "=== Установка Bot-Links-GitFlic (v9.1 Smart JSON + Migration) ==="
+info "=== Установка Bot-Links-GitFlic (v9.2 Smart JSON + Migration) ==="
 echo ""
 
 # ==== 0. Проверки окружения ====
@@ -317,7 +317,13 @@ if [[ -n "${MIGRATE_FROM:-}" ]] && [[ -f "${MIGRATE_FROM}/.env" ]]; then
 
     _migrated_env="${MIGRATE_FROM}/.env"
     _get_env_val() {
-        grep "^$1=" "$_migrated_env" 2>/dev/null | head -1 | cut -d= -f2-
+        local val
+        val=$(grep "^$1=" "$_migrated_env" 2>/dev/null | head -1 | cut -d= -f2-)
+        val="${val%\"}"
+        val="${val#\"}"
+        val="${val%\'}"
+        val="${val#\'}"
+        echo "$val"
     }
 
     _OLD_TOKEN=$(_get_env_val "TELEGRAM_TOKEN" || true)
@@ -561,7 +567,7 @@ PYCONFIG
 
 # --- bot.py ---
 cat > "$DIR/bot.py" <<'PYBOT'
-"""Bot-Links-GitFlic v9.1 (Smart JSON + Migration Edition)
+"""Bot-Links-GitFlic v9.2 (Smart JSON + Migration Edition)
 
 Возможности:
   - Извлечение имени клиента из контента подписки (vless://#Name, vmess ps, JSON tag)
@@ -597,7 +603,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import socket
 import time
 import urllib.parse
@@ -665,6 +670,21 @@ if config.SSH_KEY:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+def _send_sd_notify(msg: str) -> None:
+    """Отправить сообщение systemd через NOTIFY_SOCKET."""
+    notify_socket = os.environ.get("NOTIFY_SOCKET")
+    if not notify_socket:
+        return
+    if notify_socket.startswith('@'):
+        notify_socket = '\0' + notify_socket[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.connect(notify_socket)
+            sock.sendall(msg.encode())
+    except Exception as e:
+        logger.debug("Ошибка отправки sd_notify '%s': %s", msg, e)
+
+
 async def systemd_watchdog_task():
     """Фоновая задача для пинга systemd watchdog."""
     notify_socket = os.environ.get("NOTIFY_SOCKET")
@@ -672,28 +692,10 @@ async def systemd_watchdog_task():
         logger.warning("NOTIFY_SOCKET не найден, watchdog отключен.")
         return
 
-    # Обработка абстрактных сокетов Linux (начинаются с @)
-    if notify_socket.startswith('@'):
-        notify_socket = '\0' + notify_socket[1:]
-
     logger.info("Watchdog task запущена (ping каждые 60с).")
-    
-    # Сообщаем systemd, что бот готов к работе
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
-            sock.connect(notify_socket)
-            sock.sendall(b"READY=1")
-    except Exception as e:
-        logger.debug("Ошибка отправки READY=1: %s", e)
 
     while True:
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
-                sock.connect(notify_socket)
-                sock.sendall(b"WATCHDOG=1")
-        except Exception as e:
-            logger.debug("Ошибка отправки watchdog ping: %s", e)
-        
+        _send_sd_notify("WATCHDOG=1")
         await asyncio.sleep(60)
 
 
@@ -841,7 +843,7 @@ async def export_db() -> str:
     """Экспорт базы данных в JSON-строку для миграции."""
     db = await load_db()
     export_data = {
-        "version": "9.1",
+        "version": "9.2",
         "exported_at": now_iso(),
         "git_user": config.GIT_USER,
         "git_repo": config.GIT_REPO,
@@ -1125,7 +1127,7 @@ async def get_short(session: aiohttp.ClientSession, url: str) -> str:
     try:
         timeout = aiohttp.ClientTimeout(total=config.SHORTENER_TIMEOUT)
         async with session.get(
-            f"https://clck.ru/--?url={url}", timeout=timeout
+            f"https://clck.ru/--?url={urllib.parse.quote(url, safe='')}", timeout=timeout
         ) as r:
             if r.status == 200:
                 short = (await r.text()).strip()
@@ -1211,12 +1213,16 @@ async def _download_and_process(
         appended = entry.get("appended_configs", [])
         reapplied_count = 0
         if appended:
-            if ext == "json":
-                appended_json = json.dumps([json.loads(a["content"]) for a in appended], indent=2, ensure_ascii=False)
-                processed, reapplied_count = merge_json_configs(processed, appended_json)
-            else:
-                appended_text = "\n".join(a["content"] for a in appended)
-                processed, reapplied_count = merge_text_configs(processed, appended_text)
+            try:
+                if ext == "json":
+                    appended_json = json.dumps([json.loads(a["content"]) for a in appended], indent=2, ensure_ascii=False)
+                    processed, reapplied_count = merge_json_configs(processed, appended_json)
+                else:
+                    appended_text = "\n".join(a["content"] for a in appended)
+                    processed, reapplied_count = merge_text_configs(processed, appended_text)
+            except Exception as e:
+                logger.warning("Ошибка восстановления appended для %s: %s", name, e)
+                reapplied_count = 0
 
         return {
             "name": name,
@@ -1238,11 +1244,12 @@ async def _execute_refresh(
 ) -> dict:
     """Общая логика refresh для ручного и автоматического режимов."""
 
-    # FIX: используем Lock вместо bool-флага для потокобезопасности
-    if _refresh_lock.locked():
+    # FIX: используем wait_for с таймаутом вместо locked() для атомарного захвата лока
+    try:
+        await asyncio.wait_for(_refresh_lock.acquire(), timeout=0.1)
+    except asyncio.TimeoutError:
         return {"ok": 0, "fail": 0, "elapsed": 0, "errors": ["Уже выполняется"]}
-
-    async with _refresh_lock:
+    try:
         start_time = time.monotonic()
         total = len(db)
 
@@ -1322,6 +1329,7 @@ async def _execute_refresh(
             if r["name"] in current_db:
                 current_db[r["name"]]["last_refresh"] = refresh_time
                 current_db[r["name"]]["last_refresh_size"] = r["size"]
+                current_db[r["name"]]["size_bytes"] = r["size"]
             else:
                 logger.debug("Refresh: %s not in current_db (possibly deleted during refresh)", r["name"])
         await save_db(current_db)
@@ -1340,6 +1348,8 @@ async def _execute_refresh(
                 for r in fail_results
             ],
         }
+    finally:
+        _refresh_lock.release()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1941,7 +1951,7 @@ def remove_json_configs(content: str, proxy_indices: list[int]) -> tuple[str, in
     return result, len(remove_ob_indices), remaining_proxy
 
 
-async def _handle_removeconfig_selection(pending: dict, text: str, update: Update):
+async def _handle_removeconfig_selection(pending: dict, text: str, update: Update, context):
     """Process number selection for removeconfig."""
     client_name = pending["client_name"]
     content = pending["content"]
@@ -1963,6 +1973,8 @@ async def _handle_removeconfig_selection(pending: dict, text: str, update: Updat
         )
         return
 
+    # Удаляем pending только перед реальным действием (валидация прошла)
+    context.user_data.pop("removeconfig_pending", None)
     m = await update.message.reply_text("⏳ Удаляю конфиги...")
 
     try:
@@ -1984,6 +1996,7 @@ async def _handle_removeconfig_selection(pending: dict, text: str, update: Updat
         if client_name in db:
             db[client_name]["size_bytes"] = len(new_content.encode("utf-8"))
             db[client_name]["last_refresh"] = now_iso()
+            db[client_name]["appended_configs"] = []
             await save_db(db)
 
         await m.edit_text(
@@ -2097,11 +2110,9 @@ async def cmd_removeconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _do_removeconfigall(query) -> None:
     """Execute bulk reset to original configs for all clients."""
-    db = await load_db()
-    total = len(db)
-
     # 1. Очищаем сохраненные доп. конфиги во всей БД ДО запуска обновления
     current_db = await load_db()
+    total = len(current_db)
     for client_name in current_db:
         current_db[client_name]["appended_configs"] = []
     await save_db(current_db)
@@ -2160,7 +2171,7 @@ async def cmd_removeconfigall(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel any pending operation."""
     cleared = []
-    for key in ["removeconfig_pending", "append_pending", "appendall_pending"]:
+    for key in ["removeconfig_pending", "append_pending", "appendall_pending", "bulk_pending"]:
         if context.user_data.pop(key, None):
             cleared.append(key.replace("_pending", ""))
     if cleared:
@@ -2397,12 +2408,15 @@ async def _refresh_single_client(name: str, entry: dict) -> dict:
             # Восстановление сохраненных доп. конфигов
             appended = entry.get("appended_configs", [])
             if appended:
-                if ext == "json":
-                    appended_json = json.dumps([json.loads(a["content"]) for a in appended], indent=2, ensure_ascii=False)
-                    processed, _ = merge_json_configs(processed, appended_json)
-                else:
-                    appended_text = "\n".join(a["content"] for a in appended)
-                    processed, _ = merge_text_configs(processed, appended_text)
+                try:
+                    if ext == "json":
+                        appended_json = json.dumps([json.loads(a["content"]) for a in appended], indent=2, ensure_ascii=False)
+                        processed, _ = merge_json_configs(processed, appended_json)
+                    else:
+                        appended_text = "\n".join(a["content"] for a in appended)
+                        processed, _ = merge_text_configs(processed, appended_text)
+                except Exception as e:
+                    logger.warning("Ошибка восстановления appended для %s: %s", name, e)
 
         async with _git_lock:
             await git_sync()
@@ -2444,7 +2458,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     rules_status = "✅ включена" if config.INJECT_RULES else "❌ выключена"
     await update.message.reply_text(
-        f"🤖 <b>Bot-Links-GitFlic v9.1</b>\n\n"
+        f"🤖 <b>Bot-Links-GitFlic v9.2</b>\n\n"
         f"Отправьте URL подписки — бот:\n"
         f"  1. Скачает конфиг\n"
         f"  2. Определит имя клиента из контента\n"
@@ -2456,6 +2470,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>Команды:</b>\n"
         f"/list — список ссылок\n"
         f"/info &lt;name&gt; — ℹ️ подробная информация\n"
+        f"/search &lt;query&gt; — 🔍 поиск клиента по имени\n"
+        f"/check [name] — 🩺 проверка доступности URL\n"
         f"/delete &lt;name&gt; — удалить\n"
         f"/rename &lt;old&gt; &lt;new&gt; — переименовать\n"
         f"/seturl &lt;name&gt; &lt;url&gt; — обновить источник\n"
@@ -2464,6 +2480,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/removeconfig &lt;name&gt; — 🗑 удалить отдельные конфиги\n"
         f"/appendall — ➕ добавить конфиги сразу всем клиентам\n"
         f"/removeconfigall — 🗑 удалить ВСЕ доп. конфиги у всех (сброс к оригиналу)\n"
+        f"/bulk — 📦 массовое добавление URL\n"
+        f"/history &lt;name&gt; — 📜 история изменений клиента\n"
         f"/cancel — ❌ отменить текущую операцию\n"
         f"/status — статус бота\n"
         f"/export — экспорт БД для миграции\n"
@@ -2802,6 +2820,122 @@ async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @owner_only
+async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /search <query> — find clients by name."""
+    if not context.args:
+        return await update.message.reply_text(
+            "⚠️ Использование: <code>/search &lt;query&gt;</code>",
+            parse_mode="HTML",
+        )
+    query = " ".join(context.args).lower()
+    db = await load_db()
+    matches = {n: d for n, d in db.items() if query in n.lower()}
+    if not matches:
+        return await update.message.reply_text(f"🔍 По запросу «{query}» ничего не найдено.")
+    lines = []
+    for n, d in matches.items():
+        short = d.get("short", "—")
+        ext = d.get("ext", "txt").upper()
+        lines.append(f"• <code>{n}</code> [{ext}] — {short}")
+    await update.message.reply_text(
+        f"🔍 <b>Найдено {len(matches)} клиентов:</b>\n\n" + "\n".join(lines),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+@owner_only
+async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /check [name] — verify source URL availability."""
+    db = await load_db()
+    if not db:
+        return await update.message.reply_text("📋 Список пуст.")
+
+    if context.args:
+        name = context.args[0]
+        if name not in db:
+            return await update.message.reply_text(
+                f"⚠️ <code>{name}</code> не найден.", parse_mode="HTML"
+            )
+        targets = {name: db[name]}
+    else:
+        targets = db
+
+    m = await update.message.reply_text(f"⏳ Проверяю {len(targets)} URL...")
+
+    ok = []
+    fail = []
+    async with aiohttp.ClientSession() as session:
+        for name, entry in targets.items():
+            url = entry.get("original_url", "")
+            if not url:
+                fail.append((name, "нет URL"))
+                continue
+            try:
+                timeout = aiohttp.ClientTimeout(total=10)
+                async with session.head(url, timeout=timeout, allow_redirects=True) as resp:
+                    if resp.status < 400:
+                        ok.append(name)
+                    else:
+                        fail.append((name, f"HTTP {resp.status}"))
+            except Exception as e:
+                fail.append((name, str(e)[:50]))
+
+    report = f"🔍 <b>Проверка URL ({len(targets)} шт.)</b>\n\n"
+    report += f"✅ Доступно: {len(ok)}\n"
+    report += f"❌ Недоступно: {len(fail)}\n"
+    if fail:
+        report += "\n<b>Проблемы:</b>\n"
+        for name, err in fail[:15]:
+            report += f"• <code>{name}</code>: {err}\n"
+    await m.edit_text(report, parse_mode="HTML")
+
+
+@owner_only
+async def cmd_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /bulk — add multiple subscription URLs at once (one per line)."""
+    context.user_data["bulk_pending"] = {"created_at": time.monotonic()}
+    await update.message.reply_text(
+        "📝 <b>Массовое добавление</b>\n\n"
+        "Отправьте URL подписок (по одному на строку).\n"
+        "Каждый URL будет обработан как отдельный клиент.\n\n"
+        "Или /cancel для отмены.",
+        parse_mode="HTML",
+    )
+
+
+@owner_only
+async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /history <name> — show client change history."""
+    if not context.args:
+        return await update.message.reply_text(
+            "⚠️ Использование: <code>/history &lt;name&gt;</code>",
+            parse_mode="HTML",
+        )
+    name = context.args[0]
+    db = await load_db()
+    if name not in db:
+        return await update.message.reply_text(
+            f"⚠️ <code>{name}</code> не найден.", parse_mode="HTML"
+        )
+    entry = db[name]
+    lines = [f"📜 <b>История клиента</b> <code>{name}</code>\n"]
+    lines.append(f"📅 Создан: <code>{entry.get('created_at', '—')}</code>")
+    lines.append(f"🔄 Последнее обновление: <code>{entry.get('last_refresh', '—')}</code>")
+    lines.append(f"🔗 Источник: <code>{entry.get('original_url', '—')}</code>")
+    appended = entry.get("appended_configs", [])
+    if appended:
+        lines.append(f"\n➕ <b>Дополнительные конфиги ({len(appended)}):</b>")
+        for i, a in enumerate(appended[:20], 1):
+            added_at = a.get("added_at", "?")
+            content_preview = a.get("content", "")[:60]
+            lines.append(f"  {i}. <code>{added_at}</code> — {content_preview}…")
+    else:
+        lines.append("\nℹ️ Дополнительных конфигов нет.")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+
+
+@owner_only
 async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка нового URL подписки."""
     text = (update.message.text or "").strip()
@@ -2826,14 +2960,70 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _do_appendall(text, update)
             return
 
+    # Check for pending bulk add
+    pending_bulk = context.user_data.get("bulk_pending")
+    if pending_bulk:
+        if time.monotonic() - pending_bulk.get("created_at", 0) > 300:
+            context.user_data.pop("bulk_pending", None)
+        else:
+            context.user_data.pop("bulk_pending", None)
+            urls = [l.strip() for l in text.splitlines() if l.strip() and is_valid_url(l.strip())]
+            if not urls:
+                await update.message.reply_text("⚠️ Не найдено валидных URL.")
+                return
+            m = await update.message.reply_text(f"⏳ Обработка {len(urls)} URL...")
+            ok_count, fail_count = 0, 0
+            results_text = []
+            async with aiohttp.ClientSession() as session:
+                for url in urls:
+                    try:
+                        raw_content = await download_content(session, url)
+                        client_name = extract_client_name(raw_content)
+                        name_source = "config"
+                        if not client_name:
+                            client_name = f"cl_{uuid.uuid4().hex[:8]}"
+                            name_source = "auto"
+                        db = await load_db()
+                        base_name = client_name
+                        counter = 1
+                        while client_name in db:
+                            client_name = f"{base_name}_{counter}"
+                            counter += 1
+                        processed, ext = inject_rules(raw_content)
+                        short = await upload_single(client_name, processed, ext, session)
+                        db = await load_db()
+                        db[client_name] = {
+                            "short": short,
+                            "original_url": url,
+                            "ext": ext,
+                            "size_bytes": len(processed.encode("utf-8")),
+                            "created_at": now_iso(),
+                            "last_refresh": now_iso(),
+                            "name_source": name_source,
+                        }
+                        await save_db(db)
+                        results_text.append(f"✅ <code>{client_name}</code> — {short}")
+                        ok_count += 1
+                    except Exception as e:
+                        results_text.append(f"❌ {url[:40]}… — {e}")
+                        fail_count += 1
+            report = (
+                f"📦 <b>Массовое добавление завершено</b>\n\n"
+                f"✅ Успешно: {ok_count}\n"
+                f"❌ Ошибок: {fail_count}\n\n" +
+                "\n".join(results_text[:20])
+            )
+            await m.edit_text(report, parse_mode="HTML", disable_web_page_preview=True)
+            return
+
     # Check for pending removeconfig
     pending_remove = context.user_data.get("removeconfig_pending")
     if pending_remove:
         if time.monotonic() - pending_remove.get("created_at", 0) > 300:
             context.user_data.pop("removeconfig_pending", None)
         else:
-            context.user_data.pop("removeconfig_pending", None)
-            await _handle_removeconfig_selection(pending_remove, text, update)
+            # НЕ удаляем pending здесь — _handle_removeconfig_selection удалит при успехе
+            await _handle_removeconfig_selection(pending_remove, text, update, context)
             return
 
     # Check reply to saved message (append via reply)
@@ -3054,10 +3244,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "created_at": time.monotonic(),
         }
         await query.answer()
-        await query.edit_message_caption(
-            caption=(query.message.caption or "") + "\n\n📝 Отправьте конфиги для добавления:",
-            parse_mode="HTML",
-        )
+        try:
+            await query.edit_message_caption(
+                caption=(query.message.caption or "") + "\n\n📝 Отправьте конфиги для добавления:",
+                parse_mode="HTML",
+            )
+        except Exception:
+            # Текстовое сообщение (например, из /info) — нет caption
+            try:
+                await query.edit_message_text(
+                    (query.message.text or "") + "\n\n📝 Отправьте конфиги для добавления:",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                await query.message.reply_text(
+                    f"📝 Отправьте конфиги для добавления к <code>{client_name}</code>:",
+                    parse_mode="HTML",
+                )
 
     elif data.startswith("removeconfig_"):
         client_name = data[len("removeconfig_"):]
@@ -3126,10 +3329,13 @@ async def post_init(app: Application):
     global _scheduler, _app_ref
     _app_ref = app
 
-    await init_git()
-    
+    # Сразу отправляем READY=1 systemd, чтобы не превысить TimeoutStartSec
+    _send_sd_notify("READY=1")
+
     # Запускаем фоновый пинг для systemd Watchdog
     asyncio.create_task(systemd_watchdog_task())
+
+    await init_git()
 
     _scheduler = AsyncIOScheduler()
     _scheduler.add_job(
@@ -3183,6 +3389,10 @@ def main():
     app.add_handler(CommandHandler("rename", cmd_rename))
     app.add_handler(CommandHandler("seturl", cmd_seturl))
     app.add_handler(CommandHandler("info", cmd_info))
+    app.add_handler(CommandHandler("search", cmd_search))
+    app.add_handler(CommandHandler("check", cmd_check))
+    app.add_handler(CommandHandler("bulk", cmd_bulk))
+    app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
     app.add_error_handler(error_handler)
@@ -3220,7 +3430,7 @@ info "Настройка systemd..."
 
 cat > "/etc/systemd/system/$SERVICE.service" <<EOF
 [Unit]
-Description=Bot-Links-GitFlic Telegram Bot (Smart JSON v9.1)
+Description=Bot-Links-GitFlic Telegram Bot (Smart JSON v9.2)
 Documentation=https://gitflic.ru/project/$GIT_USER/$GIT_REPO
 After=network-online.target
 Wants=network-online.target
@@ -3300,7 +3510,7 @@ fi
 # ==== 13. Итог ====
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-success "Установка Bot-Links-GitFlic v9.1 завершена! 🎉"
+success "Установка Bot-Links-GitFlic v9.2 завершена! 🎉"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 echo "  📂 Каталог:          $DIR"
