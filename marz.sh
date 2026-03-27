@@ -2879,7 +2879,8 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         fail.append((name, f"HTTP {resp.status}"))
             except Exception as e:
-                fail.append((name, str(e)[:50]))
+                err_str = str(e)
+                fail.append((name, err_str[:50] + ("…" if len(err_str) > 50 else "")))
 
     report = f"🔍 <b>Проверка URL ({len(targets)} шт.)</b>\n\n"
     report += f"✅ Доступно: {len(ok)}\n"
