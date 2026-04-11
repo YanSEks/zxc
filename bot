@@ -597,7 +597,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import socket
 import time
 import urllib.parse
@@ -1695,7 +1694,8 @@ async def cmd_append(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Отправьте конфиги для добавления:\n"
         f"• URI-строки (vless://, vmess://, trojan://, ss://)\n"
         f"• JSON с outbounds\n"
-        f"• Base64-кодированный список\n\n"
+        f"• Base64-кодированный список\n"
+        f"• Или отправьте текстовый файл (.txt) с конфигами\n\n"
         f"Или /cancel для отмены.",
         parse_mode="HTML",
     )
@@ -1868,7 +1868,8 @@ async def cmd_appendall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Отправьте конфиги для добавления:\n"
         f"• URI-строки (vless://, vmess://, trojan://, ss://)\n"
         f"• JSON с outbounds\n"
-        f"• Base64-кодированный список\n\n"
+        f"• Base64-кодированный список\n"
+        f"• Или отправьте текстовый файл (.txt) с конфигами\n\n"
         f"Или /cancel для отмены.",
         parse_mode="HTML",
     )
@@ -2862,6 +2863,47 @@ async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @owner_only
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle incoming document (file) for pending append/appendall operations."""
+    document = update.message.document
+    if document is None:
+        return
+
+    # Check for pending append
+    pending_append = context.user_data.get("append_pending")
+    if pending_append:
+        if time.monotonic() - pending_append.get("created_at", 0) > 300:
+            context.user_data.pop("append_pending", None)
+            await update.message.reply_text("⏰ Время ожидания истекло. Повторите команду.")
+            return
+        context.user_data.pop("append_pending", None)
+        tg_file = await document.get_file()
+        data = await tg_file.download_as_bytearray()
+        text = data.decode("utf-8", errors="replace").strip()
+        await _do_append(pending_append["client_name"], text, update)
+        return
+
+    # Check for pending appendall
+    pending_appendall = context.user_data.get("appendall_pending")
+    if pending_appendall:
+        if time.monotonic() - pending_appendall.get("created_at", 0) > 300:
+            context.user_data.pop("appendall_pending", None)
+            await update.message.reply_text("⏰ Время ожидания истекло. Повторите команду.")
+            return
+        context.user_data.pop("appendall_pending", None)
+        tg_file = await document.get_file()
+        data = await tg_file.download_as_bytearray()
+        text = data.decode("utf-8", errors="replace").strip()
+        await _do_appendall(text, update)
+        return
+
+    await update.message.reply_text(
+        "ℹ️ Файл получен, но сейчас не ожидается.\n"
+        "Используйте /append или /appendall перед отправкой файла."
+    )
+
+
+@owner_only
 async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка нового URL подписки."""
     text = (update.message.text or "").strip()
@@ -2871,6 +2913,8 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending_append:
         if time.monotonic() - pending_append.get("created_at", 0) > 300:
             context.user_data.pop("append_pending", None)
+            await update.message.reply_text("⏰ Время ожидания истекло. Повторите команду.")
+            return
         else:
             context.user_data.pop("append_pending", None)
             await _do_append(pending_append["client_name"], text, update)
@@ -2881,6 +2925,8 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending_appendall:
         if time.monotonic() - pending_appendall.get("created_at", 0) > 300:
             context.user_data.pop("appendall_pending", None)
+            await update.message.reply_text("⏰ Время ожидания истекло. Повторите команду.")
+            return
         else:
             context.user_data.pop("appendall_pending", None)
             await _do_appendall(text, update)
@@ -2891,6 +2937,8 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending_remove:
         if time.monotonic() - pending_remove.get("created_at", 0) > 300:
             context.user_data.pop("removeconfig_pending", None)
+            await update.message.reply_text("⏰ Время ожидания истекло. Повторите команду.")
+            return
         else:
             context.user_data.pop("removeconfig_pending", None)
             await _handle_removeconfig_selection(pending_remove, text, update)
@@ -3114,10 +3162,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "created_at": time.monotonic(),
         }
         await query.answer()
-        await query.edit_message_caption(
-            caption=(query.message.caption or "") + "\n\n📝 Отправьте конфиги для добавления:",
-            parse_mode="HTML",
-        )
+        try:
+            await query.edit_message_caption(
+                caption=(query.message.caption or "") + "\n\n📝 Отправьте конфиги или файл для добавления:",
+                parse_mode="HTML",
+            )
+        except Exception:
+            await query.edit_message_text(
+                f"📝 Отправьте конфиги или текстовый файл для добавления к <code>{client_name}</code>:\n"
+                f"• URI-строки\n• JSON\n• Base64\n• Текстовый файл (.txt)\n\n/cancel для отмены.",
+                parse_mode="HTML",
+            )
 
     elif data.startswith("removeconfig_"):
         client_name = data[len("removeconfig_"):]
@@ -3244,6 +3299,7 @@ def main():
     app.add_handler(CommandHandler("seturl", cmd_seturl))
     app.add_handler(CommandHandler("info", cmd_info))
     app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
     app.add_error_handler(error_handler)
 
