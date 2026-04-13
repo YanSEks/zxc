@@ -1122,18 +1122,8 @@ def inject_rules(text: str) -> tuple[str, str]:
 
 
 async def get_short(session: aiohttp.ClientSession, url: str) -> str:
-    try:
-        timeout = aiohttp.ClientTimeout(total=config.SHORTENER_TIMEOUT)
-        async with session.get(
-            f"https://clck.ru/--?url={url}", timeout=timeout
-        ) as r:
-            if r.status == 200:
-                short = (await r.text()).strip()
-                if short:
-                    return short
-    except Exception as e:
-        logger.warning("Сокращатель: %s", e)
-    return url
+    """Оборачивает RAW-ссылку в прокси cloud.sayori.cc."""
+    return f"https://cloud.sayori.cc/{url}"
 
 
 def build_raw_url(name: str, ext: str) -> str:
