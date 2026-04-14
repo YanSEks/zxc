@@ -492,7 +492,6 @@ LOG_FILE=$DIR/bot.log
 APP_DIR=$DIR
 SSH_KEY=$KEY_PATH
 MAX_SIZE=2097152
-SHORTENER_TIMEOUT=5
 GIT_CMD_TIMEOUT=60
 REFRESH_CONCURRENT=5
 AUTO_REFRESH_HOURS=6
@@ -552,7 +551,6 @@ DB_FILE: str = _env("DB_FILE", required=True)
 LOG_FILE: str = _env("LOG_FILE", required=True)
 SSH_KEY: str = _env("SSH_KEY", default="")
 MAX_SIZE: int = _env("MAX_SIZE", default="2097152", cast=int)
-SHORTENER_TIMEOUT: int = _env("SHORTENER_TIMEOUT", default="5", cast=int)
 GIT_CMD_TIMEOUT: int = _env("GIT_CMD_TIMEOUT", default="60", cast=int)
 REFRESH_CONCURRENT: int = _env("REFRESH_CONCURRENT", default="5", cast=int)
 AUTO_REFRESH_HOURS: int = _env("AUTO_REFRESH_HOURS", default="6", cast=int)
@@ -1122,18 +1120,8 @@ def inject_rules(text: str) -> tuple[str, str]:
 
 
 async def get_short(session: aiohttp.ClientSession, url: str) -> str:
-    try:
-        timeout = aiohttp.ClientTimeout(total=config.SHORTENER_TIMEOUT)
-        async with session.get(
-            f"https://clck.ru/--?url={url}", timeout=timeout
-        ) as r:
-            if r.status == 200:
-                short = (await r.text()).strip()
-                if short:
-                    return short
-    except Exception as e:
-        logger.warning("Сокращатель: %s", e)
-    return url
+    """Формирует прокси-ссылку через sub.ag-07.online."""
+    return f"https://sub.ag-07.online/{url}"
 
 
 def build_raw_url(name: str, ext: str) -> str:
