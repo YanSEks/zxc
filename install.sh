@@ -792,23 +792,35 @@ func runScan(targets, countries []string, withVLESS bool) {
 		}
 	}
 
-	resolved := resolveCIDRs(cidrs)
-	atomic.StoreInt64(&scan.total, int64(len(resolved)))
-
-	if len(resolved) == 0 {
+	if len(cidrs) == 0 {
 		sendMsg("❌ Нет IP адресов для сканирования")
 		return
 	}
 
-	// Write targets file
+	// Calculate total IP count mathematically (no in-memory expansion)
+	var totalIPs int64
+	for _, cidr := range cidrs {
+		if strings.Contains(cidr, "/") {
+			_, network, err := net.ParseCIDR(cidr)
+			if err == nil {
+				ones, bits := network.Mask.Size()
+				totalIPs += int64(1) << uint(bits-ones)
+			}
+		} else {
+			totalIPs++
+		}
+	}
+	atomic.StoreInt64(&scan.total, totalIPs)
+
+	// Write CIDRs directly to targets file — masscan supports CIDR notation natively
 	targetsFile := filepath.Join(cfg.TmpDir, "targets.txt")
 	f, err := os.Create(targetsFile)
 	if err != nil {
 		log.Printf("targets file error: %v", err)
 		return
 	}
-	for _, ip := range resolved {
-		fmt.Fprintln(f, ip)
+	for _, cidr := range cidrs {
+		fmt.Fprintln(f, cidr)
 	}
 	f.Close()
 
@@ -828,6 +840,8 @@ func runScan(targets, countries []string, withVLESS bool) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "masscan", masscanArgs...)
+	var masscanStderr bytes.Buffer
+	cmd.Stderr = &masscanStderr
 	if err := cmd.Start(); err != nil {
 		log.Printf("masscan start error: %v", err)
 		sendMsg("❌ Ошибка запуска masscan: " + err.Error())
@@ -841,7 +855,12 @@ func runScan(targets, countries []string, withVLESS bool) {
 
 	go func() {
 		defer close(done)
-		_ = cmd.Wait()
+		if err := cmd.Wait(); err != nil {
+			if s := masscanStderr.String(); s != "" {
+				log.Printf("masscan stderr: %s", s)
+			}
+			log.Printf("masscan exit: %v", err)
+		}
 	}()
 
 	waitLoop:
@@ -866,6 +885,10 @@ func runScan(targets, countries []string, withVLESS bool) {
 
 	// Parse masscan results
 	scan.openPorts = parseMasscan(outputFile, countries)
+
+	// Reset progress counters for the CF-check phase
+	atomic.StoreInt64(&scan.total, int64(len(scan.openPorts)))
+	atomic.StoreInt64(&scan.checked, 0)
 
 	// Check workers
 	wc := cfg.Workers
@@ -1416,45 +1439,6 @@ func parseMasscan(path string, countries []string) []OpenPort {
 	return ports
 }
 
-// ─── resolveCIDRs ────────────────────────────────────────────────────────────
-
-func resolveCIDRs(cidrs []string) []string {
-	ipSet := make(map[string]struct{})
-	for _, cidr := range cidrs {
-		if !strings.Contains(cidr, "/") {
-			ipSet[cidr] = struct{}{}
-			continue
-		}
-		_, network, err := net.ParseCIDR(cidr)
-		if err != nil {
-			continue
-		}
-		for ip := cloneIP(network.IP); network.Contains(ip); incrementIP(ip) {
-			ipSet[ip.String()] = struct{}{}
-		}
-	}
-	result := make([]string, 0, len(ipSet))
-	for ip := range ipSet {
-		result = append(result, ip)
-	}
-	return result
-}
-
-func cloneIP(ip net.IP) net.IP {
-	c := make(net.IP, len(ip))
-	copy(c, ip)
-	return c
-}
-
-func incrementIP(ip net.IP) {
-	for i := len(ip) - 1; i >= 0; i-- {
-		ip[i]++
-		if ip[i] != 0 {
-			break
-		}
-	}
-}
-
 // ─── fetchASN ────────────────────────────────────────────────────────────────
 
 func fetchASN(asn string) ([]string, error) {
@@ -1517,14 +1501,27 @@ func loadGeoIP() error {
 		if len(parts) < 3 {
 			continue
 		}
-		start, err1 := strconv.ParseUint(strings.TrimSpace(parts[0]), 10, 32)
-		end, err2 := strconv.ParseUint(strings.TrimSpace(parts[1]), 10, 32)
+		startIP := net.ParseIP(strings.TrimSpace(parts[0]))
+		endIP := net.ParseIP(strings.TrimSpace(parts[1]))
 		cc := strings.TrimSpace(parts[2])
-		if err1 != nil || err2 != nil || cc == "" {
+		if startIP == nil || endIP == nil || cc == "" {
 			continue
 		}
-		entries = append(entries, geoEntry{uint32(start), uint32(end), cc})
+		start4 := startIP.To4()
+		end4 := endIP.To4()
+		if start4 == nil || end4 == nil {
+			continue
+		}
+		entries = append(entries, geoEntry{
+			binary.BigEndian.Uint32(start4),
+			binary.BigEndian.Uint32(end4),
+			cc,
+		})
 	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].start < entries[j].start
+	})
 
 	geoMu.Lock()
 	geoEntries = entries
