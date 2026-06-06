@@ -133,7 +133,7 @@ cleanup_old() {
 # ─── apt dependencies + masscan ──────────────────────────────────────────────
 install_dependencies() {
     echo -e "${BLUE}[>>]${NC} Установка зависимостей..."
-    apt-get update -qq
+    apt-get update -qq || echo -e "${YELLOW}[WARN]${NC} apt update failed, continuing..."
     apt-get install -y -qq \
         curl wget git build-essential libpcap-dev \
         unzip ca-certificates gnupg lsb-release \
@@ -233,9 +233,11 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -260,7 +262,9 @@ import (
 
 var Version = "17.1"
 
-// ─── Config ──────────────────────────────────────────────────────────────────
+// MaxResults ограничивает рост scan.results для предотвращения OOM
+const MaxResults = 50000
+
 
 type Config struct {
 	BotToken     string
@@ -338,6 +342,7 @@ type Result struct {
 	CFLatency int64
 	VLESSLat  int64
 	VLESSWork bool
+	Score     float64 // качественный рейтинг (выше — лучше)
 }
 
 // ─── ScanState ───────────────────────────────────────────────────────────────
@@ -475,13 +480,16 @@ func main() {
 	bot.Handle("/status", cmdStatus)
 	bot.Handle("/test", cmdTest)
 	bot.Handle("/config", cmdConfig)
+	bot.Handle("/recheck", cmdRecheck)
 	bot.Handle(tele.OnText, handleText)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		bot.Stop()
+		log.Println("🛑 Получен сигнал завершения")
+		forceStop()
+		time.Sleep(3 * time.Second)
 		os.Exit(0)
 	}()
 
@@ -545,7 +553,7 @@ func cmdStart(c tele.Context) error {
 • <code>EU DE FR</code> — регион + страны
 • <code>FAST +vless</code> — быстрые + VLESS
 
-ℹ️ Команды: /status /stop /test /config`,
+ℹ️ Команды: /status /stop /test /config /recheck`,
 		Version, cfg.Workers, cfg.MasscanRate, cfg.MasscanPorts, vlessStatus)
 	return c.Send(msg, &tele.SendOptions{ParseMode: tele.ModeHTML})
 }
@@ -822,6 +830,7 @@ func runScan(targets, countries []string, withVLESS bool) {
 		"-iL", targetsFile,
 		"-oJ", outputFile,
 		"--open",
+		"--exclude", "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10",
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -903,12 +912,15 @@ func runScan(targets, countries []string, withVLESS bool) {
 
 	for r := range resultsCh {
 		scan.mu.Lock()
-		scan.results = append(scan.results, r)
+		if len(scan.results) < MaxResults {
+			r.Score = calculateScore(r)
+			scan.results = append(scan.results, r)
+		}
 		scan.mu.Unlock()
 	}
 
 	sort.Slice(scan.results, func(i, j int) bool {
-		return scan.results[i].CFLatency < scan.results[j].CFLatency
+		return scan.results[i].Score > scan.results[j].Score
 	})
 
 	sendResults()
@@ -938,11 +950,12 @@ func checkWorker(op OpenPort, withVLESS bool) *Result {
 		return nil
 	}
 	cfLatency := time.Since(start).Milliseconds()
-	defer resp.Body.Close()
 
 	body := make([]byte, 4096)
 	n, _ := resp.Body.Read(body)
 	bodyStr := string(body[:n])
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
 
 	if !strings.Contains(bodyStr, "cloudflare") {
 		return nil
@@ -967,12 +980,16 @@ func checkWorker(op OpenPort, withVLESS bool) *Result {
 		}
 	}
 
+	r.Score = calculateScore(*r)
 	return r
 }
 
 // ─── checkVLESS ──────────────────────────────────────────────────────────────
 
 func checkVLESS(ip string, port int) error {
+	if vless.SNI == "" {
+		return fmt.Errorf("empty SNI")
+	}
 	addr := fmt.Sprintf("%s:%d", ip, port)
 	tlsCfg := &tls.Config{
 		ServerName:         vless.SNI,
@@ -1295,13 +1312,16 @@ func sendResults() {
 		limit = len(results)
 	}
 	for i, r := range results[:limit] {
-		line := fmt.Sprintf("%d. <code>%s:%d</code> %s %dms",
-			i+1, r.IP, r.Port, r.Country, r.CFLatency)
+		line := fmt.Sprintf("%d. <code>%s:%d</code> %s %dms score: %.2f",
+			i+1, r.IP, r.Port, r.Country, r.CFLatency, r.Score)
 		if r.VLESSWork {
 			line += " ✅VLESS"
 		}
 		sb.WriteString(line + "\n")
 	}
+
+	// Сохраняем результаты для /recheck
+	saveLastResults(results)
 
 	// Build ZIP
 	zipPath := filepath.Join(cfg.TmpDir, "results.zip")
@@ -1356,12 +1376,22 @@ func buildResultsZip(zipPath string, results []Result) error {
 
 	// results.csv
 	if w, err := zw.Create("results.csv"); err == nil {
-		fmt.Fprintln(w, "ip,port,country,cf_latency_ms,vless_latency_ms,vless_ok,config")
+		fmt.Fprintln(w, "ip,port,country,cf_latency_ms,vless_latency_ms,vless_work,score,config")
 		for _, r := range results {
-			fmt.Fprintf(w, "%s,%d,%s,%d,%d,%v,%s\n",
+			fmt.Fprintf(w, "%s,%d,%s,%d,%d,%v,%.4f,%s\n",
 				r.IP, r.Port, r.Country, r.CFLatency, r.VLESSLat,
-				r.VLESSWork, r.Config)
+				r.VLESSWork, r.Score, r.Config)
 		}
+	}
+
+	// clash.yaml — конфиг для Clash
+	if w, err := zw.Create("clash.yaml"); err == nil {
+		fmt.Fprint(w, exportClash(results))
+	}
+
+	// singbox.json — конфиг для Sing-Box
+	if w, err := zw.Create("singbox.json"); err == nil {
+		fmt.Fprint(w, exportSingBox(results))
 	}
 
 	return nil
@@ -1468,6 +1498,11 @@ func fetchASN(asn string) ([]string, error) {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != 200 {
+		log.Printf("⚠️ ASN API returned %d for AS%s", resp.StatusCode, asn)
+		return nil, fmt.Errorf("ASN API status %d", resp.StatusCode)
+	}
+
 	var result struct {
 		Data struct {
 			Prefixes []struct {
@@ -1510,10 +1545,13 @@ func loadGeoIP() error {
 	defer f.Close()
 
 	var entries []geoEntry
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
-		parts := strings.Split(line, ",")
+	r := csv.NewReader(f)
+	r.ReuseRecord = true
+	for {
+		parts, err := r.Read()
+		if err != nil {
+			break
+		}
 		if len(parts) < 3 {
 			continue
 		}
@@ -1590,6 +1628,252 @@ func uniqueStrings(ss []string) []string {
 	return out
 }
 
+// ─── calculateScore ──────────────────────────────────────────────────────────
+
+// calculateScore вычисляет качественный рейтинг результата (выше — лучше).
+// Веса: CF Latency 30%, VLESS Latency 40%, Порт 30%.
+func calculateScore(r Result) float64 {
+	// Нормализуем латентность: меньше — лучше → инвертируем
+	cfScore := 0.0
+	if r.CFLatency > 0 {
+		cfScore = 1000.0 / float64(r.CFLatency)
+	}
+	vlessScore := 0.0
+	if r.VLESSWork && r.VLESSLat > 0 {
+		vlessScore = 1000.0 / float64(r.VLESSLat)
+	}
+	// Бонус за стандартные порты
+	portBonus := 0.0
+	switch r.Port {
+	case 443, 80:
+		portBonus = 1.0
+	case 8443, 2053, 2083, 2087, 2096:
+		portBonus = 0.5
+	}
+	return cfScore*0.3 + vlessScore*0.4 + portBonus*0.3
+}
+
+// ─── saveLastResults ─────────────────────────────────────────────────────────
+
+// saveLastResults сохраняет результаты в data/last_results.json для /recheck.
+func saveLastResults(results []Result) {
+	path := filepath.Join(cfg.DataDir, "last_results.json")
+	data, err := json.MarshalIndent(results, "", "  ")
+	if err != nil {
+		log.Printf("saveLastResults marshal error: %v", err)
+		return
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		log.Printf("saveLastResults write error: %v", err)
+	}
+}
+
+// ─── cmdRecheck ──────────────────────────────────────────────────────────────
+
+// cmdRecheck перепроверяет ранее найденные IP из last_results.json.
+func cmdRecheck(c tele.Context) error {
+	if !isAdmin(c) {
+		return c.Send("⛔ Доступ запрещён")
+	}
+	if atomic.LoadInt32(&scan.stopped) == 0 {
+		return c.Send("⚠️ Сканирование уже запущено. Используйте /stop для остановки.")
+	}
+
+	path := filepath.Join(cfg.DataDir, "last_results.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return c.Send("❌ Нет сохранённых результатов. Выполните сканирование сначала.")
+	}
+
+	var last []Result
+	if err := json.Unmarshal(data, &last); err != nil || len(last) == 0 {
+		return c.Send("❌ Не удалось загрузить сохранённые результаты.")
+	}
+
+	_ = c.Send(fmt.Sprintf("🔄 Перепроверка %d IP из последнего сканирования...", len(last)))
+
+	chatID := c.Chat().ID
+	go func() {
+		withVLESS := vless.Enabled
+		var fresh []Result
+		for _, r := range last {
+			nr := checkWorker(OpenPort{IP: r.IP, Port: r.Port}, withVLESS)
+			if nr != nil {
+				fresh = append(fresh, *nr)
+			}
+		}
+		// Сортируем по score
+		sort.Slice(fresh, func(i, j int) bool {
+			return fresh[i].Score > fresh[j].Score
+		})
+
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("✅ <b>Перепроверка завершена</b>\n\nРабочих IP: <code>%d / %d</code>\n\n<b>Топ-10:</b>\n", len(fresh), len(last)))
+		limit := 10
+		if len(fresh) < limit {
+			limit = len(fresh)
+		}
+		for i, r := range fresh[:limit] {
+			line := fmt.Sprintf("%d. <code>%s:%d</code> %s %dms score: %.2f",
+				i+1, r.IP, r.Port, r.Country, r.CFLatency, r.Score)
+			if r.VLESSWork {
+				line += " ✅VLESS"
+			}
+			sb.WriteString(line + "\n")
+		}
+
+		recipient := tele.ChatID(chatID)
+		if len(fresh) == 0 {
+			_, _ = bot.Send(recipient, "🔍 Перепроверка завершена. Рабочих IP не найдено.", &tele.SendOptions{ParseMode: tele.ModeHTML})
+			return
+		}
+
+		zipPath := filepath.Join(cfg.TmpDir, "recheck_results.zip")
+		if err := buildResultsZip(zipPath, fresh); err == nil {
+			defer os.Remove(zipPath)
+			doc := &tele.Document{
+				File:     tele.FromDisk(zipPath),
+				FileName: "recheck_results.zip",
+				Caption:  sb.String(),
+			}
+			_, _ = bot.Send(recipient, doc, &tele.SendOptions{ParseMode: tele.ModeHTML})
+		} else {
+			_, _ = bot.Send(recipient, sb.String(), &tele.SendOptions{ParseMode: tele.ModeHTML})
+		}
+	}()
+	return nil
+}
+
+// ─── exportClash ─────────────────────────────────────────────────────────────
+
+// exportClash генерирует конфигурацию Clash из найденных рабочих VLESS IP.
+func exportClash(results []Result) string {
+	var sb strings.Builder
+	sb.WriteString("# CF Scanner — Clash config\n")
+	sb.WriteString("# Generated: " + time.Now().Format(time.RFC3339) + "\n\n")
+	sb.WriteString("proxies:\n")
+	for i, r := range results {
+		if r.Config == "" {
+			continue
+		}
+		name := fmt.Sprintf("CF-%s-%d-%d", r.Country, r.Port, i+1)
+		sb.WriteString(fmt.Sprintf("  - name: \"%s\"\n", name))
+		sb.WriteString("    type: vless\n")
+		sb.WriteString(fmt.Sprintf("    server: %s\n", r.IP))
+		sb.WriteString(fmt.Sprintf("    port: %d\n", r.Port))
+		sb.WriteString(fmt.Sprintf("    uuid: %s\n", vless.UUID))
+		sb.WriteString("    udp: true\n")
+		if vless.Security == "tls" {
+			sb.WriteString("    tls: true\n")
+			sb.WriteString(fmt.Sprintf("    servername: %s\n", vless.SNI))
+			sb.WriteString("    skip-cert-verify: true\n")
+		}
+		if vless.Type == "ws" {
+			sb.WriteString("    network: ws\n")
+			sb.WriteString("    ws-opts:\n")
+			sb.WriteString(fmt.Sprintf("      path: %s\n", vless.Path))
+			if vless.Host != "" {
+				sb.WriteString("      headers:\n")
+				sb.WriteString(fmt.Sprintf("        Host: %s\n", vless.Host))
+			}
+		}
+	}
+	sb.WriteString("\nproxy-groups:\n")
+	sb.WriteString("  - name: CF-Scanner\n")
+	sb.WriteString("    type: url-test\n")
+	sb.WriteString("    url: https://www.gstatic.com/generate_204\n")
+	sb.WriteString("    interval: 300\n")
+	sb.WriteString("    proxies:\n")
+	for i, r := range results {
+		if r.Config == "" {
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("      - CF-%s-%d-%d\n", r.Country, r.Port, i+1))
+	}
+	return sb.String()
+}
+
+// ─── exportSingBox ───────────────────────────────────────────────────────────
+
+// exportSingBox генерирует конфигурацию Sing-Box из найденных рабочих VLESS IP.
+func exportSingBox(results []Result) string {
+	type sbOutbound struct {
+		Tag        string `json:"tag"`
+		Type       string `json:"type"`
+		Server     string `json:"server"`
+		ServerPort int    `json:"server_port"`
+		UUID       string `json:"uuid"`
+		TLS        *struct {
+			Enabled    bool   `json:"enabled"`
+			ServerName string `json:"server_name"`
+			Insecure   bool   `json:"insecure"`
+		} `json:"tls,omitempty"`
+		Transport *struct {
+			Type string `json:"type"`
+			Path string `json:"path,omitempty"`
+			Headers map[string]string `json:"headers,omitempty"`
+		} `json:"transport,omitempty"`
+	}
+
+	var outbounds []sbOutbound
+	var tags []string
+	for i, r := range results {
+		if r.Config == "" {
+			continue
+		}
+		tag := fmt.Sprintf("CF-%s-%d-%d", r.Country, r.Port, i+1)
+		ob := sbOutbound{
+			Tag:        tag,
+			Type:       "vless",
+			Server:     r.IP,
+			ServerPort: r.Port,
+			UUID:       vless.UUID,
+		}
+		if vless.Security == "tls" {
+			ob.TLS = &struct {
+				Enabled    bool   `json:"enabled"`
+				ServerName string `json:"server_name"`
+				Insecure   bool   `json:"insecure"`
+			}{Enabled: true, ServerName: vless.SNI, Insecure: true}
+		}
+		if vless.Type == "ws" {
+			tr := &struct {
+				Type    string            `json:"type"`
+				Path    string            `json:"path,omitempty"`
+				Headers map[string]string `json:"headers,omitempty"`
+			}{Type: "ws", Path: vless.Path}
+			if vless.Host != "" {
+				tr.Headers = map[string]string{"Host": vless.Host}
+			}
+			ob.Transport = tr
+		}
+		outbounds = append(outbounds, ob)
+		tags = append(tags, tag)
+	}
+
+	obList := make([]interface{}, 0, len(outbounds)+1)
+	obList = append(obList, map[string]interface{}{
+		"tag":       "CF-Scanner",
+		"type":      "urltest",
+		"outbounds": tags,
+		"url":       "https://www.gstatic.com/generate_204",
+		"interval":  "5m",
+	})
+	for _, o := range outbounds {
+		obList = append(obList, o)
+	}
+
+	sbConfig := map[string]interface{}{
+		"outbounds": obList,
+	}
+
+	data, err := json.MarshalIndent(sbConfig, "", "  ")
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
+}
+
 // ─── forceStop ───────────────────────────────────────────────────────────────
 
 func forceStop() {
@@ -1608,12 +1892,15 @@ GOCODE
 build_scanner() {
     echo -e "${BLUE}[>>]${NC} Сборка сканера..."
     export PATH="/usr/local/go/bin:$PATH"
+    export GOPATH="$INSTALL_DIR/.gopath"
+    export GOCACHE="$INSTALL_DIR/.gocache"
     cd "$INSTALL_DIR"
 
     go mod tidy 2>&1 | tail -5
 
     CGO_ENABLED=0 go build \
         -ldflags="-s -w -X main.Version=${VERSION}" \
+        -trimpath \
         -o cfscanner \
         . 2>&1
 
